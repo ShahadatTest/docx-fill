@@ -94,6 +94,8 @@ pub struct Extensions {
     /// strike, sup/sub, mark, code, pre, hr, blockquote, alignment, colours and sizes. Off, it
     /// reads only p, br, h1-h6, b/strong, i/em, u and lists, without attributes.
     pub html_extras: bool,
+    /// `{%%name}`, alone in its paragraph, centres the paragraph. Off, it draws as `{%name}` does.
+    pub centered_images: bool,
 }
 
 impl Extensions {
@@ -109,6 +111,7 @@ impl Extensions {
         footnotes: true,
         full_tables: true,
         html_extras: true,
+        centered_images: true,
     };
     pub const NONE: Extensions = Extensions {
         vertical_tables: false,
@@ -122,6 +125,7 @@ impl Extensions {
         footnotes: false,
         full_tables: false,
         html_extras: false,
+        centered_images: false,
     };
 }
 

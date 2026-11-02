@@ -140,3 +140,28 @@ fn prints_nothing_when_the_hook_has_no_image() {
 
     assert!(!part(&filled, "word/document.xml").unwrap().contains("<w:drawing>"));
 }
+
+#[test]
+fn centres_a_double_percent_images_paragraph() {
+    let filled = fill(document(&(paragraph("{%%centred}") + &paragraph("{%plain}"))), json!({ "centred": "photo:c", "plain": "photo:p" }));
+
+    let xml = part(&filled, "word/document.xml").unwrap();
+    let paragraphs: Vec<&str> = xml.split("</w:p>").collect();
+    assert!(paragraphs[0].contains(r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r>"#));
+    assert!(!paragraphs[1].contains("w:jc"));
+}
+
+#[test]
+fn leaves_a_centred_tags_paragraph_alone_when_it_draws_nothing() {
+    let filled = fill(document(&paragraph("{%%centred}")), json!({ "centred": "" }));
+
+    assert!(!part(&filled, "word/document.xml").unwrap().contains("w:jc"));
+}
+
+#[test]
+fn rejects_a_centred_image_beside_other_text() {
+    let parts = document(&paragraph("Logo {%%logo}")).into_iter().map(|(name, xml)| (name.to_string(), xml.into_bytes()));
+    let error = PackageTemplate::parse(parts, &FillOptions::default()).unwrap_err();
+
+    assert_eq!(error.message, r#"Centered Images should be placed in empty paragraphs, but the tag "%%logo" is not"#);
+}

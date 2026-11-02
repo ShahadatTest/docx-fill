@@ -37,8 +37,9 @@ pub(crate) enum TagKind {
     CellStyle,
     /// `{~~name}` (block) or `{~name}` (inline): HTML printed as Word runs and paragraphs.
     RichText { is_block: bool },
-    /// `{%name}` or `{%%name}`: an image filling its table cell, else the page's width.
-    Image { cell_width: Option<f64> },
+    /// `{%name}` or `{%%name}`: an image filling its table cell, else the page's width. With
+    /// centred images on, `{%%name}` centres its paragraph.
+    Image { cell_width: Option<f64>, is_centered: bool },
     /// `{:stylepar name}`, `{:stylerow name}` or `{:stylerun name}`.
     Style(StyleTarget),
     /// `{:merge-cells-col 1,2}` or `{:merge-cells-row}`: merges equal cells of the tag's table.
@@ -202,7 +203,7 @@ impl Template {
 
         for tag in &mut tags {
             match &mut tag.kind {
-                TagKind::Image { cell_width } => *cell_width = read_cell_width(&parts, tag.part),
+                TagKind::Image { cell_width, .. } => *cell_width = read_cell_width(&parts, tag.part),
                 TagKind::Value if options.linebreaks => tag.run_props = read_run_props(&parts, tag.part),
                 TagKind::Footnote => tag.run_props = read_run_props(&parts, tag.part),
                 _ => {}
@@ -461,8 +462,11 @@ fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, S
         }
     }
     if extensions.images {
-        let name = text.strip_prefix("%%").or_else(|| text.strip_prefix('%'))?;
-        return Some((TagKind::Image { cell_width: None }, name.trim().to_string()));
+        if let Some(name) = text.strip_prefix("%%") {
+            return Some((TagKind::Image { cell_width: None, is_centered: extensions.centered_images }, name.trim().to_string()));
+        }
+        let name = text.strip_prefix('%')?;
+        return Some((TagKind::Image { cell_width: None, is_centered: false }, name.trim().to_string()));
     }
     None
 }
@@ -537,6 +541,9 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                     children: Vec::new(),
                     open_tag: index,
                 });
+            }
+            TagKind::Image { is_centered: true, .. } if !tag.is_alone => {
+                return Err(FillError::new(format!("Centered Images should be placed in empty paragraphs, but the tag \"{}\" is not", tag.text)));
             }
             TagKind::FullTable => {
                 if !tag.is_alone {

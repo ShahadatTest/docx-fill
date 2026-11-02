@@ -288,7 +288,7 @@ impl<'a> Render<'a, '_> {
                                 paragraph.1 = true;
                             }
                         }
-                        TagKind::Image { cell_width } => self.print_image(value(), cell_width),
+                        TagKind::Image { cell_width, is_centered } => self.print_image(value(), cell_width, is_centered),
                         TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close | TagKind::FullTable | TagKind::GridOpen => {}
                     }
                 }
@@ -363,9 +363,12 @@ impl<'a> Render<'a, '_> {
         self.footnotes.push((id, text));
     }
 
-    fn print_image(&mut self, value: Option<&Value>, cell_width: Option<f64>) {
+    fn print_image(&mut self, value: Option<&Value>, cell_width: Option<f64>, is_centered: bool) {
         let Some(value) = value.filter(|value| is_truthy(value)) else { return };
         let Some(image) = self.hooks.image(self.part, value) else { return };
+        if let (true, Some(paragraph)) = (is_centered, self.paragraphs.last_mut()) {
+            paragraph.2.get_or_insert_with(Style::default).align = Some("center");
+        }
 
         let (body_width, body_height) = body_or_default(self.template.body.or(self.state.body));
         let width = cell_width.unwrap_or(body_width) * self.state.container_fill;
