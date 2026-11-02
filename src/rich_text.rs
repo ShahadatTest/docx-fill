@@ -6,21 +6,72 @@
 //! paragraph with the tag paragraph's properties and the tag run's font; bold, italic and
 //! underline carry over. A tag sharing its paragraph with other text, or an inline tag, prints
 //! inline, paragraphs joined by line breaks. An empty value leaves the tag's paragraph empty.
+//!
+//! With extras on, it also reads attributes and the HTML module's documented elements: links,
+//! s/del/strike, ins, sup, sub, mark, code, pre, hr, blockquote, div, center, tables, checkboxes,
+//! `<ol start>`, `<li value>`, list-style-type, and inline `style` (color, background-color,
+//! font-size in px or pt, font-family, font-weight, font-style, text-decoration, text-align).
 
 use crate::cell_styling::{find_element_start, remove_first_element};
+use crate::properties::{PARAGRAPH_ORDER, RUN_ORDER, set_child};
+use crate::xml::escape;
 
 // Stands in for a value in the filled XML until its paragraph closes.
 pub(crate) const MARK_START: char = '\u{E000}';
 pub(crate) const MARK_END: char = '\u{E001}';
 
 const LIST_INDENT_TWIPS: u32 = 360;
+const QUOTE_INDENT_TWIPS: u32 = 720;
 const BULLET: &str = "\u{2022}";
 // Half-points, h1 to h6.
 const HEADING_SIZES: [u32; 6] = [32, 28, 26, 24, 24, 24];
+const CODE_FONT: &str = "Courier New";
+const LINK_COLOR: &str = "0563C1";
+const CHECKED: &str = "\u{2612}";
+const UNCHECKED: &str = "\u{2610}";
+const TABLE_BORDERS: &str = "<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/></w:tblBorders>";
+// Grid column width for HTML tables, which take the full width (5000 fiftieths of a percent).
+const TABLE_COLUMN_TWIPS: u32 = 2000;
 
 pub(crate) struct RichValue {
     pub html: String,
     pub is_block: bool,
+    pub has_extras: bool,
+}
+
+/// How a run looks beyond the tag run's own properties.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Format {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strike: Option<bool>,
+    vert_align: Option<&'static str>,
+    highlight: Option<&'static str>,
+    color: Option<String>,
+    /// Half-points.
+    size: Option<u32>,
+    font: Option<String>,
+    shade: Option<String>,
+    link: Option<String>,
+}
+
+impl Format {
+    /// This format with `over`'s settings on top.
+    fn and(mut self, over: &Format) -> Format {
+        self.bold = over.bold.or(self.bold);
+        self.italic = over.italic.or(self.italic);
+        self.underline = over.underline.or(self.underline);
+        self.strike = over.strike.or(self.strike);
+        self.vert_align = over.vert_align.or(self.vert_align);
+        self.highlight = over.highlight.or(self.highlight);
+        self.color = over.color.clone().or(self.color);
+        self.size = over.size.or(self.size);
+        self.font = over.font.clone().or(self.font);
+        self.shade = over.shade.clone().or(self.shade);
+        self.link = over.link.clone().or(self.link);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +81,7 @@ struct Run {
     is_bold: bool,
     is_italic: bool,
     is_underlined: bool,
+    format: Format,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +89,16 @@ struct Block {
     runs: Vec<Run>,
     heading_level: Option<usize>,
     list: Option<(usize, String)>,
+    align: Option<&'static str>,
+    quote_level: u32,
+    is_rule: bool,
+    table: Option<Vec<Vec<Cell>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Cell {
+    span: usize,
+    blocks: Vec<Block>,
 }
 
 pub(crate) fn mark(index: usize) -> String {
@@ -44,36 +106,88 @@ pub(crate) fn mark(index: usize) -> String {
 }
 
 /// A filled paragraph holding rich text marks, rewritten with the values' runs and paragraphs.
-pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue]) -> String {
+/// External links are added to `links`, whose position names their relationship.
+pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue], links: &mut Vec<String>) -> String {
     let Some((mark, index)) = find_mark(paragraph) else { return paragraph.to_string() };
     let value = &values[index];
     let other_text = read_text(paragraph).replacen(&mark, "", 1);
     let run = find_run(paragraph, &mark);
     let run_props = run.and_then(|run| find_between(run, "<w:rPr>", "</w:rPr>")).unwrap_or("");
-    let blocks = read_html(&value.html);
+    let blocks = read_html(&value.html, value.has_extras);
 
     // Alone in its paragraph: the paragraph becomes the value's paragraphs.
     if value.is_block && other_text.trim().is_empty() && !blocks.is_empty() && run.is_some() {
         let open = &paragraph[..paragraph.find('>').map_or(0, |at| at + 1)];
         let paragraph_props = find_between(paragraph, "<w:pPr>", "</w:pPr>").unwrap_or("");
         let bookmarks = find_bookmarks(paragraph);
-        return blocks
-            .iter()
-            .enumerate()
-            .map(|(index, block)| {
-                let bookmarks = if index == 0 { bookmarks.as_str() } else { "" };
-                format!("{open}{}{bookmarks}{}</w:p>", write_paragraph_props(paragraph_props, block), write_runs(block, run_props))
-            })
-            .collect();
+        let mut out = String::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let bookmarks = if index == 0 { bookmarks.as_str() } else { "" };
+            write_block(&mut out, open, paragraph_props, bookmarks, block, run_props, links);
+        }
+        // A table cannot end a cell; the tag paragraph's look follows it.
+        if blocks.last().is_some_and(|block| block.table.is_some()) {
+            out.push_str(&format!("{open}{paragraph_props}</w:p>"));
+        }
+        return out;
     }
 
     // Beside other text: the runs go where the tag was, joined by breaks.
-    let inline = blocks.iter().map(|block| write_runs(block, run_props)).collect::<Vec<_>>().join(&format!("<w:r>{run_props}<w:br/></w:r>"));
+    let inline = blocks.iter().map(|block| write_inline(block, run_props, links)).collect::<Vec<_>>().join(&format!("<w:r>{run_props}<w:br/></w:r>"));
     let replaced = match run {
         Some(run) => paragraph.replacen(run, &split_run(run, &mark, &inline), 1),
         None => paragraph.replacen(&mark, "", 1),
     };
-    write_paragraph(&replaced, values)
+    write_paragraph(&replaced, values, links)
+}
+
+fn write_block(out: &mut String, open: &str, paragraph_props: &str, bookmarks: &str, block: &Block, run_props: &str, links: &mut Vec<String>) {
+    let Some(rows) = &block.table else {
+        out.push_str(&format!("{open}{}{bookmarks}{}</w:p>", write_paragraph_props(paragraph_props, block), write_runs(block, run_props, links)));
+        return;
+    };
+    let columns = rows.iter().map(|row| row.iter().map(|cell| cell.span).sum::<usize>()).max().unwrap_or(1).max(1);
+    out.push_str(&format!("<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/>{TABLE_BORDERS}</w:tblPr><w:tblGrid>"));
+    for _ in 0..columns {
+        out.push_str(&format!("<w:gridCol w:w=\"{TABLE_COLUMN_TWIPS}\"/>"));
+    }
+    out.push_str("</w:tblGrid>");
+    for row in rows {
+        out.push_str("<w:tr>");
+        let mut used = 0;
+        for cell in row {
+            out.push_str("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/>");
+            if cell.span > 1 {
+                out.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", cell.span));
+            }
+            out.push_str("</w:tcPr>");
+            for block in &cell.blocks {
+                write_block(out, "<w:p>", "", "", block, run_props, links);
+            }
+            if cell.blocks.last().is_none_or(|block| block.table.is_some()) {
+                out.push_str("<w:p/>");
+            }
+            out.push_str("</w:tc>");
+            used += cell.span;
+        }
+        for _ in used..columns {
+            out.push_str("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr><w:p/></w:tc>");
+        }
+        out.push_str("</w:tr>");
+    }
+    out.push_str("</w:tbl>");
+}
+
+/// A block's runs for printing inside a paragraph; a table's cells are joined by tabs and its
+/// rows by breaks.
+fn write_inline(block: &Block, run_props: &str, links: &mut Vec<String>) -> String {
+    let Some(rows) = &block.table else { return write_runs(block, run_props, links) };
+    let mut lines = Vec::new();
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(|cell| cell.blocks.iter().map(|block| write_inline(block, run_props, links)).collect()).collect();
+        lines.push(cells.join(&format!("<w:r>{run_props}<w:tab/></w:r>")));
+    }
+    lines.join(&format!("<w:r>{run_props}<w:br/></w:r>"))
 }
 
 fn find_mark(xml: &str) -> Option<(String, usize)> {
@@ -150,84 +264,457 @@ fn find_bookmarks(paragraph: &str) -> String {
     found
 }
 
-/// The HTML's paragraphs, headings and list items, with their runs.
-fn read_html(html: &str) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut lists: Vec<(bool, usize)> = Vec::new();
-    let (mut bold, mut italic, mut underline) = (0i32, 0i32, 0i32);
-    let mut current: Option<usize> = None;
+/// How list items are numbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Numbering {
+    Bullet,
+    Decimal,
+    UpperAlpha,
+    LowerAlpha,
+    UpperRoman,
+    LowerRoman,
+}
 
-    let add_run = |blocks: &mut Vec<Block>, current: &mut Option<usize>, text: Option<String>, is_break: bool, format: (i32, i32, i32)| {
-        let index = *current.get_or_insert_with(|| {
-            blocks.push(Block::default());
-            blocks.len() - 1
-        });
-        blocks[index].runs.push(Run { text, is_break, is_bold: format.0 > 0, is_italic: format.1 > 0, is_underlined: format.2 > 0 });
+impl Numbering {
+    fn read(name: &str) -> Option<Numbering> {
+        match name.trim() {
+            "1" | "decimal" => Some(Numbering::Decimal),
+            "A" | "upper-alpha" | "upper-latin" => Some(Numbering::UpperAlpha),
+            "a" | "lower-alpha" | "lower-latin" => Some(Numbering::LowerAlpha),
+            "I" | "upper-roman" => Some(Numbering::UpperRoman),
+            "i" | "lower-roman" => Some(Numbering::LowerRoman),
+            "disc" | "circle" | "square" | "none" => Some(Numbering::Bullet),
+            _ => None,
+        }
+    }
+
+    fn marker(self, number: i64) -> String {
+        match self {
+            Numbering::Bullet => BULLET.to_string(),
+            Numbering::Decimal => format!("{number}."),
+            Numbering::UpperAlpha => format!("{}.", write_letters(number)),
+            Numbering::LowerAlpha => format!("{}.", write_letters(number).to_ascii_lowercase()),
+            Numbering::UpperRoman => format!("{}.", write_roman(number)),
+            Numbering::LowerRoman => format!("{}.", write_roman(number).to_ascii_lowercase()),
+        }
+    }
+}
+
+/// 1 → A, 26 → Z, 27 → AA.
+fn write_letters(number: i64) -> String {
+    let mut number = number.max(1);
+    let mut letters = Vec::new();
+    while number > 0 {
+        number -= 1;
+        letters.push((b'A' + (number % 26) as u8) as char);
+        number /= 26;
+    }
+    letters.iter().rev().collect()
+}
+
+fn write_roman(number: i64) -> String {
+    const NUMERALS: [(i64, &str); 13] =
+        [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")];
+    let mut number = number.max(1);
+    let mut out = String::new();
+    for (value, numeral) in NUMERALS {
+        while number >= value {
+            out.push_str(numeral);
+            number -= value;
+        }
+    }
+    out
+}
+
+/// What an open container element gives the blocks inside it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Container {
+    align: Option<&'static str>,
+    quote_level: u32,
+    is_pre: bool,
+}
+
+/// Builds blocks from HTML tokens.
+struct Reader {
+    /// Blocks being collected: the value's, then each open table cell's.
+    collections: Vec<Vec<Block>>,
+    current: Option<usize>,
+    lists: Vec<(Numbering, i64)>,
+    // Without extras, nesting counts of b/strong, i/em and u.
+    counts: (i32, i32, i32),
+    /// Open inline elements and the format each adds.
+    formats: Vec<(String, Format)>,
+    containers: Vec<(String, Container)>,
+    /// Open tables: how many collections were open before each, and its rows.
+    tables: Vec<(usize, Vec<Vec<Cell>>)>,
+}
+
+impl Reader {
+    fn blocks(&mut self) -> &mut Vec<Block> {
+        self.collections.last_mut().expect("the value's collection stays")
+    }
+
+    fn format(&self) -> Format {
+        self.formats.iter().fold(Format::default(), |format, (_, over)| format.and(over))
+    }
+
+    fn container(&self) -> Container {
+        self.containers.iter().fold(Container::default(), |outer, (_, inner)| Container {
+            align: inner.align.or(outer.align),
+            quote_level: outer.quote_level + inner.quote_level,
+            is_pre: outer.is_pre || inner.is_pre,
+        })
+    }
+
+    fn start_block(&mut self, block: Block) {
+        let container = self.container();
+        let block = Block { align: block.align.or(container.align), quote_level: container.quote_level, ..block };
+        self.blocks().push(block);
+        self.current = Some(self.blocks().len() - 1);
+    }
+
+    fn add_run(&mut self, text: Option<String>, is_break: bool) {
+        if self.current.is_none() {
+            self.start_block(Block::default());
+        }
+        let (bold, italic, underline) = self.counts;
+        let run = Run { text, is_break, is_bold: bold > 0, is_italic: italic > 0, is_underlined: underline > 0, format: self.format() };
+        let index = self.current.expect("started above");
+        self.blocks()[index].runs.push(run);
+    }
+
+    fn is_in_list(&mut self) -> bool {
+        let current = self.current;
+        current.is_some_and(|index| self.blocks()[index].list.is_some())
+    }
+
+    /// Ends the open cell, if any, giving it the blocks collected in it.
+    fn close_cell(&mut self) {
+        let Some((depth, rows)) = self.tables.last_mut() else { return };
+        if self.collections.len() <= *depth + 1 {
+            return;
+        }
+        let blocks = self.collections.pop().expect("checked above");
+        if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+            cell.blocks = blocks;
+        }
+        self.current = None;
+    }
+
+    /// Ends the innermost open `name` element of a stack, leaving those opened after it.
+    fn close<T>(stack: &mut Vec<(String, T)>, name: &str) {
+        if let Some(at) = stack.iter().rposition(|(each, _)| each == name) {
+            stack.remove(at);
+        }
+    }
+}
+
+/// The HTML's paragraphs, headings, list items and, with extras, tables, with their runs.
+fn read_html(html: &str, has_extras: bool) -> Vec<Block> {
+    let mut reader = Reader {
+        collections: vec![Vec::new()],
+        current: None,
+        lists: Vec::new(),
+        counts: (0, 0, 0),
+        formats: Vec::new(),
+        containers: Vec::new(),
+        tables: Vec::new(),
     };
 
-    for token in read_html_tokens(html) {
-        let (is_closing, tag) = match token {
+    for token in read_html_tokens(html, has_extras) {
+        let (is_closing, tag, attributes) = match token {
             HtmlToken::Text(text) => {
                 let decoded = decode_entities(text);
-                if current.is_some() || !decoded.trim().is_empty() {
-                    add_run(&mut blocks, &mut current, Some(decoded), false, (bold, italic, underline));
+                if reader.container().is_pre {
+                    for (index, line) in decoded.split('\n').enumerate() {
+                        if index > 0 {
+                            reader.add_run(None, true);
+                        }
+                        if !line.is_empty() {
+                            reader.add_run(Some(line.to_string()), false);
+                        }
+                    }
+                } else if reader.current.is_some() || !decoded.trim().is_empty() {
+                    reader.add_run(Some(decoded), false);
                 }
                 continue;
             }
-            HtmlToken::Tag { is_closing, name } => (is_closing, name.to_ascii_lowercase()),
+            HtmlToken::Tag { is_closing, name, attributes } => (is_closing, name.to_ascii_lowercase(), attributes),
         };
+        if has_extras && read_extra_tag(&mut reader, is_closing, &tag, &attributes) {
+            continue;
+        }
+
         let step = if is_closing { -1 } else { 1 };
         let heading = tag.strip_prefix('h').and_then(|level| level.parse::<usize>().ok()).filter(|level| (1..=6).contains(level));
-        let is_in_list = current.is_some_and(|index| blocks[index].list.is_some());
+        let is_in_list = reader.is_in_list();
 
         match tag.as_str() {
-            "strong" | "b" => bold += step,
-            "em" | "i" => italic += step,
-            "u" => underline += step,
+            "strong" | "b" => reader.counts.0 += step,
+            "em" | "i" => reader.counts.1 += step,
+            "u" => reader.counts.2 += step,
             // A <br> between paragraphs is a blank line.
-            "br" if current.is_some() => add_run(&mut blocks, &mut current, None, true, (bold, italic, underline)),
+            "br" if reader.current.is_some() => reader.add_run(None, true),
             "br" => {
-                blocks.push(Block::default());
-                current = None;
+                reader.blocks().push(Block::default());
+                reader.current = None;
             }
             "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !is_in_list => {
                 if is_closing {
-                    current = None;
+                    reader.current = None;
                 } else {
-                    blocks.push(Block { heading_level: heading, ..Block::default() });
-                    current = Some(blocks.len() - 1);
+                    let align = has_extras.then(|| read_style(&attributes, "text-align").and_then(read_align)).flatten();
+                    reader.start_block(Block { heading_level: heading, align, ..Block::default() });
                 }
             }
             "ul" | "ol" => {
-                current = None;
+                reader.current = None;
                 if is_closing {
-                    lists.pop();
-                } else {
-                    lists.push((tag == "ol", 0));
+                    reader.lists.pop();
+                    continue;
+                }
+                let numbering = if tag == "ol" { Numbering::Decimal } else { Numbering::Bullet };
+                let numbering = has_extras
+                    .then(|| read_style(&attributes, "list-style-type").or_else(|| read_attribute(&attributes, "type")).and_then(Numbering::read))
+                    .flatten()
+                    .unwrap_or(numbering);
+                let start = has_extras.then(|| read_attribute(&attributes, "start").and_then(|start| start.trim().parse::<i64>().ok())).flatten().unwrap_or(1);
+                reader.lists.push((numbering, start - 1));
+            }
+            "li" => {
+                let level = reader.lists.len();
+                match reader.lists.last_mut() {
+                    Some((numbering, count)) if !is_closing => {
+                        let value = has_extras.then(|| read_attribute(&attributes, "value").and_then(|value| value.trim().parse::<i64>().ok())).flatten();
+                        *count = value.unwrap_or(*count + 1);
+                        let marker = numbering.marker(*count);
+                        reader.start_block(Block { list: Some((level - 1, marker)), ..Block::default() });
+                    }
+                    _ => reader.current = None,
                 }
             }
-            "li" => match lists.last_mut() {
-                Some((is_ordered, count)) if !is_closing => {
-                    *count += 1;
-                    let marker = if *is_ordered { format!("{count}.") } else { BULLET.to_string() };
-                    blocks.push(Block { list: Some((lists.len() - 1, marker)), ..Block::default() });
-                    current = Some(blocks.len() - 1);
-                }
-                _ => current = None,
-            },
             _ => {}
         }
     }
-    blocks
+    reader.collections.swap_remove(0)
+}
+
+/// Handles an element only extras read. Returns whether it was one.
+fn read_extra_tag(reader: &mut Reader, is_closing: bool, tag: &str, attributes: &[(String, String)]) -> bool {
+    let inline = match tag {
+        "strong" | "b" => Some(Format { bold: Some(true), ..Format::default() }),
+        "em" | "i" | "cite" | "var" => Some(Format { italic: Some(true), ..Format::default() }),
+        "u" | "ins" => Some(Format { underline: Some(true), ..Format::default() }),
+        "s" | "strike" | "del" => Some(Format { strike: Some(true), ..Format::default() }),
+        "sup" => Some(Format { vert_align: Some("superscript"), ..Format::default() }),
+        "sub" => Some(Format { vert_align: Some("subscript"), ..Format::default() }),
+        "mark" => Some(Format { highlight: Some("yellow"), ..Format::default() }),
+        "code" | "kbd" | "samp" | "tt" => Some(Format { font: Some(CODE_FONT.to_string()), highlight: Some("lightGray"), ..Format::default() }),
+        "a" => Some(Format {
+            link: read_attribute(attributes, "href").map(str::to_string),
+            color: Some(LINK_COLOR.to_string()),
+            underline: Some(true),
+            ..Format::default()
+        }),
+        "span" | "font" | "small" | "big" | "abbr" | "q" => Some(Format::default()),
+        _ => None,
+    };
+    if let Some(format) = inline {
+        if is_closing {
+            Reader::close(&mut reader.formats, tag);
+        } else {
+            reader.formats.push((tag.to_string(), format.and(&read_css(attributes))));
+        }
+        return true;
+    }
+
+    match tag {
+        "div" | "center" | "blockquote" | "pre" | "section" | "article" | "header" | "footer" | "main" => {
+            reader.current = None;
+            if is_closing {
+                Reader::close(&mut reader.containers, tag);
+                Reader::close(&mut reader.formats, tag);
+                return true;
+            }
+            let align = if tag == "center" { Some("center") } else { read_style(attributes, "text-align").and_then(read_align) };
+            let container = Container { align, quote_level: u32::from(tag == "blockquote"), is_pre: tag == "pre" };
+            reader.containers.push((tag.to_string(), container));
+            let mut format = read_css(attributes);
+            if tag == "pre" {
+                format.font = format.font.or_else(|| Some(CODE_FONT.to_string()));
+            }
+            reader.formats.push((tag.to_string(), format));
+            true
+        }
+        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" => {
+            // The core branch starts or ends the block; its CSS formats the text inside.
+            if is_closing {
+                Reader::close(&mut reader.formats, tag);
+            } else {
+                reader.formats.push((tag.to_string(), read_css(attributes)));
+            }
+            false
+        }
+        "hr" => {
+            reader.start_block(Block { is_rule: true, ..Block::default() });
+            reader.current = None;
+            true
+        }
+        "input" => {
+            if read_attribute(attributes, "type").is_some_and(|kind| kind.eq_ignore_ascii_case("checkbox")) {
+                let is_checked = attributes.iter().any(|(name, _)| name == "checked");
+                reader.add_run(Some(if is_checked { CHECKED } else { UNCHECKED }.to_string()), false);
+            }
+            true
+        }
+        "table" => {
+            reader.current = None;
+            if !is_closing {
+                let depth = reader.collections.len() - 1;
+                reader.tables.push((depth, Vec::new()));
+                return true;
+            }
+            reader.close_cell();
+            if let Some((_, rows)) = reader.tables.pop() {
+                reader.blocks().push(Block { table: Some(rows), ..Block::default() });
+            }
+            reader.current = None;
+            true
+        }
+        "tr" => {
+            reader.close_cell();
+            if let (false, Some((_, rows))) = (is_closing, reader.tables.last_mut()) {
+                rows.push(Vec::new());
+            }
+            true
+        }
+        "td" | "th" => {
+            reader.close_cell();
+            if !is_closing {
+                let span = read_attribute(attributes, "colspan").and_then(|span| span.trim().parse::<usize>().ok()).unwrap_or(1).max(1);
+                if let Some((_, rows)) = reader.tables.last_mut() {
+                    if rows.is_empty() {
+                        rows.push(Vec::new());
+                    }
+                    rows.last_mut().expect("pushed above").push(Cell { span, blocks: Vec::new() });
+                }
+                reader.collections.push(Vec::new());
+                let mut format = read_css(attributes);
+                if tag == "th" {
+                    format.bold = format.bold.or(Some(true));
+                }
+                reader.formats.push((tag.to_string(), format));
+                return true;
+            }
+            Reader::close(&mut reader.formats, tag);
+            true
+        }
+        "thead" | "tbody" | "tfoot" | "col" | "colgroup" | "caption" | "img" | "svg" | "script" | "style" | "template" => true,
+        _ => false,
+    }
+}
+
+fn read_attribute<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attributes.iter().find(|(each, _)| each == name).map(|(_, value)| value.as_str())
+}
+
+/// One property of an element's `style` attribute.
+fn read_style<'a>(attributes: &'a [(String, String)], property: &str) -> Option<&'a str> {
+    read_attribute(attributes, "style")?.split(';').find_map(|declaration| {
+        let (name, value) = declaration.split_once(':')?;
+        (name.trim().eq_ignore_ascii_case(property)).then(|| value.trim())
+    })
+}
+
+fn read_align(align: &str) -> Option<&'static str> {
+    match align.trim() {
+        "left" | "start" => Some("left"),
+        "center" => Some("center"),
+        "right" | "end" => Some("right"),
+        "justify" => Some("both"),
+        _ => None,
+    }
+}
+
+/// The run format an element's `style` attribute asks for.
+fn read_css(attributes: &[(String, String)]) -> Format {
+    let style = |property: &str| read_style(attributes, property);
+    let decoration = style("text-decoration").unwrap_or_default();
+    Format {
+        bold: style("font-weight").and_then(|weight| match weight {
+            "bold" | "bolder" => Some(true),
+            "normal" | "lighter" => Some(false),
+            number => number.parse::<u32>().ok().map(|weight| weight >= 600),
+        }),
+        italic: style("font-style").map(|font_style| font_style == "italic" || font_style == "oblique"),
+        underline: decoration.contains("underline").then_some(true).or_else(|| (decoration == "none").then_some(false)),
+        strike: decoration.contains("line-through").then_some(true).or_else(|| (decoration == "none").then_some(false)),
+        color: style("color").and_then(read_color),
+        shade: style("background-color").or_else(|| style("background")).and_then(read_color),
+        size: style("font-size").and_then(read_font_size),
+        font: style("font-family").map(|family| family.split(',').next().unwrap_or(family).trim().trim_matches(['"', '\'']).to_string()).filter(|family| !family.is_empty()),
+        ..Format::default()
+    }
+}
+
+/// A CSS colour as six hex digits: `#abc`, `#aabbcc`, `rgb(r, g, b)` or a basic name.
+fn read_color(color: &str) -> Option<String> {
+    let color = color.trim().to_ascii_lowercase();
+    if let Some(hex) = color.strip_prefix('#') {
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        return match hex.len() {
+            3 => Some(hex.chars().flat_map(|digit| [digit, digit]).collect::<String>().to_ascii_uppercase()),
+            6 => Some(hex.to_ascii_uppercase()),
+            _ => None,
+        };
+    }
+    if let Some(channels) = color.strip_prefix("rgb(").or_else(|| color.strip_prefix("rgba(")).and_then(|rest| rest.strip_suffix(')')) {
+        let values: Vec<u8> = channels.split(',').take(3).filter_map(|channel| channel.trim().parse::<f64>().ok()).map(|value| value.clamp(0.0, 255.0).round() as u8).collect();
+        return (values.len() == 3).then(|| format!("{:02X}{:02X}{:02X}", values[0], values[1], values[2]));
+    }
+    let named = match color.as_str() {
+        "black" => "000000",
+        "white" => "FFFFFF",
+        "red" => "FF0000",
+        "green" => "008000",
+        "blue" => "0000FF",
+        "yellow" => "FFFF00",
+        "orange" => "FFA500",
+        "purple" => "800080",
+        "gray" | "grey" => "808080",
+        "silver" => "C0C0C0",
+        "navy" => "000080",
+        "teal" => "008080",
+        "maroon" => "800000",
+        _ => return None,
+    };
+    Some(named.to_string())
+}
+
+/// A CSS font size in px or pt as Word half-points. Pixels are 96 to the inch.
+fn read_font_size(size: &str) -> Option<u32> {
+    let size = size.trim();
+    let (number, points_per_unit) = if let Some(px) = size.strip_suffix("px") {
+        (px, 0.75)
+    } else if let Some(pt) = size.strip_suffix("pt") {
+        (pt, 1.0)
+    } else {
+        return None;
+    };
+    let points = number.trim().parse::<f64>().ok()? * points_per_unit;
+    (points > 0.0).then(|| (points * 2.0).round() as u32)
 }
 
 enum HtmlToken<'a> {
-    Tag { is_closing: bool, name: &'a str },
+    Tag { is_closing: bool, name: &'a str, attributes: Vec<(String, String)> },
     Text(&'a str),
 }
 
 /// `<name>`, `</name>`, `<name/>` and the text between. A `<` starting anything else is skipped.
-fn read_html_tokens(html: &str) -> Vec<HtmlToken<'_>> {
+/// With extras, start tags may carry attributes, and comments are dropped.
+fn read_html_tokens(html: &str, has_extras: bool) -> Vec<HtmlToken<'_>> {
     let mut tokens = Vec::new();
     let mut at = 0;
     while at < html.len() {
@@ -238,7 +725,11 @@ fn read_html_tokens(html: &str) -> Vec<HtmlToken<'_>> {
             at += end;
             continue;
         }
-        match read_html_tag(rest) {
+        if has_extras && rest.starts_with("<!--") {
+            at += rest.find("-->").map_or(rest.len(), |end| end + 3);
+            continue;
+        }
+        match read_html_tag(rest, has_extras) {
             Some((token, length)) => {
                 tokens.push(token);
                 at += length;
@@ -249,7 +740,7 @@ fn read_html_tokens(html: &str) -> Vec<HtmlToken<'_>> {
     tokens
 }
 
-fn read_html_tag(text: &str) -> Option<(HtmlToken<'_>, usize)> {
+fn read_html_tag(text: &str, has_extras: bool) -> Option<(HtmlToken<'_>, usize)> {
     let is_closing = text[1..].starts_with('/');
     let name_start = if is_closing { 2 } else { 1 };
     let name_length = text[name_start..].bytes().take_while(u8::is_ascii_alphanumeric).count();
@@ -257,6 +748,10 @@ fn read_html_tag(text: &str) -> Option<(HtmlToken<'_>, usize)> {
         return None;
     }
     let mut at = name_start + name_length;
+    let mut attributes = Vec::new();
+    if has_extras && !is_closing {
+        at += read_attributes(&text[at..], &mut attributes)?;
+    }
     at += text[at..].bytes().take_while(u8::is_ascii_whitespace).count();
     if text[at..].starts_with('/') {
         at += 1;
@@ -264,29 +759,111 @@ fn read_html_tag(text: &str) -> Option<(HtmlToken<'_>, usize)> {
     if !text[at..].starts_with('>') {
         return None;
     }
-    Some((HtmlToken::Tag { is_closing, name: &text[name_start..name_start + name_length] }, at + 1))
+    Some((HtmlToken::Tag { is_closing, name: &text[name_start..name_start + name_length], attributes }, at + 1))
+}
+
+/// Reads `name="value"`, `name='value'`, `name=value` and bare `name` attributes up to the tag's
+/// end. Returns the bytes read; `None` for a tag that never ends.
+fn read_attributes(text: &str, attributes: &mut Vec<(String, String)>) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    loop {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return None;
+        }
+        if bytes[at] == b'>' || bytes[at] == b'/' {
+            return Some(at);
+        }
+        let name_start = at;
+        while at < bytes.len() && !bytes[at].is_ascii_whitespace() && !matches!(bytes[at], b'=' | b'>' | b'/') {
+            at += 1;
+        }
+        let name = text[name_start..at].to_ascii_lowercase();
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() || bytes[at] != b'=' {
+            attributes.push((name, String::new()));
+            continue;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let value = match bytes.get(at) {
+            Some(&quote @ (b'"' | b'\'')) => {
+                let end = at + 1 + text[at + 1..].find(quote as char)?;
+                let value = &text[at + 1..end];
+                at = end + 1;
+                value
+            }
+            Some(_) => {
+                let start = at;
+                while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'>' {
+                    at += 1;
+                }
+                &text[start..at]
+            }
+            None => return None,
+        };
+        attributes.push((name, decode_entities(value)));
+    }
 }
 
 fn write_paragraph_props(paragraph_props: &str, block: &Block) -> String {
-    let Some((level, _)) = &block.list else { return paragraph_props.to_string() };
-    let indent = format!("<w:ind w:left=\"{}\" w:hanging=\"{LIST_INDENT_TWIPS}\"/>", LIST_INDENT_TWIPS * (*level as u32 + 1));
-    let inner = paragraph_props.strip_prefix("<w:pPr>").and_then(|props| props.strip_suffix("</w:pPr>")).unwrap_or("");
-    let inner = remove_first_element(inner, "<w:ind");
-    let inner = match find_between(&inner, "<w:numPr>", "</w:numPr>") {
-        Some(numbering) => inner.replacen(numbering, "", 1),
-        None => inner,
+    let mut props = match &block.list {
+        Some((level, _)) => {
+            let indent = format!("<w:ind w:left=\"{}\" w:hanging=\"{LIST_INDENT_TWIPS}\"/>", LIST_INDENT_TWIPS * (*level as u32 + 1));
+            let inner = paragraph_props.strip_prefix("<w:pPr>").and_then(|props| props.strip_suffix("</w:pPr>")).unwrap_or("");
+            let inner = remove_first_element(inner, "<w:ind");
+            let inner = match find_between(&inner, "<w:numPr>", "</w:numPr>") {
+                Some(numbering) => inner.replacen(numbering, "", 1),
+                None => inner,
+            };
+            format!("<w:pPr>{inner}{indent}</w:pPr>")
+        }
+        None => paragraph_props.to_string(),
     };
-    format!("<w:pPr>{inner}{indent}</w:pPr>")
+    if block.align.is_none() && block.quote_level == 0 && !block.is_rule {
+        return props;
+    }
+
+    let mut inner = props.strip_prefix("<w:pPr>").and_then(|props| props.strip_suffix("</w:pPr>")).unwrap_or("").to_string();
+    if block.is_rule {
+        inner = set_child(&inner, "w:pBdr", "<w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/></w:pBdr>", PARAGRAPH_ORDER);
+    }
+    if block.quote_level > 0 && block.list.is_none() {
+        inner = set_child(&inner, "w:ind", &format!("<w:ind w:left=\"{}\"/>", QUOTE_INDENT_TWIPS * block.quote_level), PARAGRAPH_ORDER);
+    }
+    if let Some(align) = block.align {
+        inner = set_child(&inner, "w:jc", &format!("<w:jc w:val=\"{align}\"/>"), PARAGRAPH_ORDER);
+    }
+    props = format!("<w:pPr>{inner}</w:pPr>");
+    props
 }
 
-fn write_runs(block: &Block, run_props: &str) -> String {
+fn write_runs(block: &Block, run_props: &str, links: &mut Vec<String>) -> String {
     let size = block.heading_level.map(|level| HEADING_SIZES[level - 1]);
     let mut out = match &block.list {
         Some((_, marker)) => format!("<w:r>{run_props}<w:t>{marker}</w:t></w:r><w:r>{run_props}<w:tab/></w:r>"),
         None => String::new(),
     };
+    let mut open_link: Option<&str> = None;
     for run in &block.runs {
-        let props = write_run_props(run_props, run.is_bold || block.heading_level.is_some(), run.is_italic, run.is_underlined, size);
+        let link = run.format.link.as_deref();
+        if link != open_link {
+            if open_link.is_some() {
+                out.push_str("</w:hyperlink>");
+            }
+            if let Some(link) = link {
+                out.push_str(&write_link_start(link, links));
+            }
+            open_link = link;
+        }
+        let props = write_run_props(run_props, run.is_bold || block.heading_level.is_some(), run.is_italic, run.is_underlined, size, &run.format);
         out.push_str("<w:r>");
         out.push_str(&props);
         if run.is_break {
@@ -298,10 +875,32 @@ fn write_runs(block: &Block, run_props: &str) -> String {
         }
         out.push_str("</w:r>");
     }
+    if open_link.is_some() {
+        out.push_str("</w:hyperlink>");
+    }
     out
 }
 
-fn write_run_props(run_props: &str, is_bold: bool, is_italic: bool, is_underlined: bool, size: Option<u32>) -> String {
+/// A hyperlink's start: to a bookmark for `#name`, else by a relationship to the address.
+fn write_link_start(link: &str, links: &mut Vec<String>) -> String {
+    let mut escaped = String::new();
+    if let Some(anchor) = link.strip_prefix('#') {
+        escape(anchor, &mut escaped);
+        return format!("<w:hyperlink w:anchor=\"{escaped}\" w:history=\"1\">");
+    }
+    let index = links.iter().position(|each| each == link).unwrap_or_else(|| {
+        links.push(link.to_string());
+        links.len() - 1
+    });
+    format!("<w:hyperlink r:id=\"{}\" w:history=\"1\">", link_relationship_id(index))
+}
+
+/// The relationship id of a part's `index`th link.
+pub(crate) fn link_relationship_id(index: usize) -> String {
+    format!("rIdDocxFillLink{}", index + 1)
+}
+
+fn write_run_props(run_props: &str, is_bold: bool, is_italic: bool, is_underlined: bool, size: Option<u32>, format: &Format) -> String {
     let mut inner = run_props.strip_prefix("<w:rPr>").and_then(|props| props.strip_suffix("</w:rPr>")).unwrap_or("").to_string();
     if let Some(size) = size {
         while let Some(start) = find_element_start(&inner, "<w:sz").or_else(|| find_element_start(&inner, "<w:szCs")) {
@@ -319,7 +918,51 @@ fn write_run_props(run_props: &str, is_bold: bool, is_italic: bool, is_underline
     if is_underlined && !inner.contains("<w:u ") {
         inner.push_str("<w:u w:val=\"single\"/>");
     }
+    if *format != Format::default() {
+        inner = write_format(&inner, format);
+    }
     if inner.is_empty() { String::new() } else { format!("<w:rPr>{inner}</w:rPr>") }
+}
+
+/// Run properties with an extras format set, in schema order.
+fn write_format(inner: &str, format: &Format) -> String {
+    let mut inner = inner.to_string();
+    let toggle = |is_on: bool, name: &str| if is_on { format!("<{name}/>") } else { format!("<{name} w:val=\"0\"/>") };
+    if let Some(font) = &format.font {
+        let mut family = String::new();
+        escape(font, &mut family);
+        inner = set_child(&inner, "w:rFonts", &format!("<w:rFonts w:ascii=\"{family}\" w:hAnsi=\"{family}\" w:cs=\"{family}\"/>"), RUN_ORDER);
+    }
+    if let Some(bold) = format.bold {
+        inner = set_child(&inner, "w:b", &toggle(bold, "w:b"), RUN_ORDER);
+    }
+    if let Some(italic) = format.italic {
+        inner = set_child(&inner, "w:i", &toggle(italic, "w:i"), RUN_ORDER);
+    }
+    if let Some(strike) = format.strike {
+        inner = set_child(&inner, "w:strike", &toggle(strike, "w:strike"), RUN_ORDER);
+    }
+    if let Some(color) = &format.color {
+        inner = set_child(&inner, "w:color", &format!("<w:color w:val=\"{color}\"/>"), RUN_ORDER);
+    }
+    if let Some(size) = format.size {
+        inner = set_child(&inner, "w:sz", &format!("<w:sz w:val=\"{size}\"/>"), RUN_ORDER);
+        inner = set_child(&inner, "w:szCs", &format!("<w:szCs w:val=\"{size}\"/>"), RUN_ORDER);
+    }
+    if let Some(highlight) = format.highlight {
+        inner = set_child(&inner, "w:highlight", &format!("<w:highlight w:val=\"{highlight}\"/>"), RUN_ORDER);
+    }
+    if let Some(underline) = format.underline {
+        let value = if underline { "single" } else { "none" };
+        inner = set_child(&inner, "w:u", &format!("<w:u w:val=\"{value}\"/>"), RUN_ORDER);
+    }
+    if let Some(shade) = &format.shade {
+        inner = set_child(&inner, "w:shd", &format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{shade}\"/>"), RUN_ORDER);
+    }
+    if let Some(vert_align) = format.vert_align {
+        inner = set_child(&inner, "w:vertAlign", &format!("<w:vertAlign w:val=\"{vert_align}\"/>"), RUN_ORDER);
+    }
+    inner
 }
 
 /// HTML text escaped for `<w:t>`: `&`, `<` and `>` only.
@@ -386,7 +1029,13 @@ mod tests {
 
     #[test]
     fn skips_a_tag_with_attributes_as_text() {
-        let blocks = read_html("<p class=\"x\">t</p>");
+        let blocks = read_html("<p class=\"x\">t</p>", false);
         assert_eq!(blocks[0].runs[0].text.as_deref(), Some("p class=\"x\">t"));
+    }
+
+    #[test]
+    fn numbers_list_items_in_letters_and_roman_numerals() {
+        assert_eq!([1, 26, 27, 52].map(write_letters), ["A", "Z", "AA", "AZ"]);
+        assert_eq!([1, 4, 9, 14, 1994].map(write_roman), ["I", "IV", "IX", "XIV", "MCMXCIV"]);
     }
 }

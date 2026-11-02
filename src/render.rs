@@ -64,6 +64,8 @@ pub(crate) struct FilledPart {
     pub media: Vec<MediaUse>,
     /// Footnote ids and their text, referenced from the part.
     pub footnotes: Vec<(u32, String)>,
+    /// External link addresses, by relationship index.
+    pub links: Vec<String>,
 }
 
 struct Render<'a, 'h> {
@@ -83,6 +85,7 @@ struct Render<'a, 'h> {
     rich_values: Vec<RichValue>,
     media: Vec<MediaUse>,
     footnotes: Vec<(u32, String)>,
+    links: Vec<String>,
 }
 
 impl Template {
@@ -113,10 +116,11 @@ impl Template {
             rich_values: Vec::new(),
             media: Vec::new(),
             footnotes: Vec::new(),
+            links: Vec::new(),
         };
         let mut scopes = vec![data];
         render.render_range(0, self.parts.len(), &self.top, &mut scopes);
-        FilledPart { xml: render.out, media: render.media, footnotes: render.footnotes }
+        FilledPart { xml: render.out, media: render.media, footnotes: render.footnotes, links: render.links }
     }
 }
 
@@ -279,7 +283,7 @@ impl<'a> Render<'a, '_> {
                         TagKind::RichText { is_block } => {
                             let html = value().and_then(Value::as_str).unwrap_or_default().to_string();
                             self.out.push_str(&rich_text::mark(self.rich_values.len()));
-                            self.rich_values.push(RichValue { html, is_block });
+                            self.rich_values.push(RichValue { html, is_block, has_extras: self.template.html_extras });
                             if let Some(paragraph) = self.paragraphs.last_mut() {
                                 paragraph.1 = true;
                             }
@@ -308,7 +312,7 @@ impl<'a> Render<'a, '_> {
                 if !has_rich_text && style.is_none() {
                     return;
                 }
-                let mut written = if has_rich_text { rich_text::write_paragraph(&self.out[opened..], &self.rich_values) } else { self.out[opened..].to_string() };
+                let mut written = if has_rich_text { rich_text::write_paragraph(&self.out[opened..], &self.rich_values, &mut self.links) } else { self.out[opened..].to_string() };
                 if let Some(style) = style {
                     written = edit_each(&written, PARAGRAPH, |paragraph| style_paragraph(paragraph, &style, true));
                 }

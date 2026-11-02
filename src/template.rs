@@ -112,6 +112,7 @@ pub struct Template {
     /// Blocks not inside another, in document order.
     pub(crate) top: Vec<usize>,
     pub(crate) linebreaks: bool,
+    pub(crate) html_extras: bool,
     /// The largest drawing id the part uses, so new drawings take ids after it.
     pub(crate) max_drawing_id: u32,
     /// Page width and height in pixels, less margins, from the part's last section.
@@ -217,6 +218,7 @@ impl Template {
             blocks,
             top: Vec::new(),
             linebreaks: options.linebreaks,
+            html_extras: options.extensions.html_extras,
         };
         template.nest_blocks()?;
         Ok(template)

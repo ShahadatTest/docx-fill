@@ -45,6 +45,7 @@ use render::FillState;
 pub(crate) const DOCUMENT_PART: &str = "word/document.xml";
 pub(crate) const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const IMAGE_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+const HYPERLINK_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 const RELATIONSHIPS_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 // Images fill their container less 5% for cell padding.
 pub(crate) const CONTAINER_FILL: f64 = 0.95;
@@ -89,6 +90,10 @@ pub struct Extensions {
     /// `{:table name}` builds a table from data in place of its paragraph; `{:#grid name}` …
     /// `{:/grid}` prints the paragraphs between them once per item, in a grid of cells.
     pub full_tables: bool,
+    /// Rich text also reads the HTML module's further elements and inline styles: links, tables,
+    /// strike, sup/sub, mark, code, pre, hr, blockquote, alignment, colours and sizes. Off, it
+    /// reads only p, br, h1-h6, b/strong, i/em, u and lists, without attributes.
+    pub html_extras: bool,
 }
 
 impl Extensions {
@@ -103,6 +108,7 @@ impl Extensions {
         paragraph_placeholder: true,
         footnotes: true,
         full_tables: true,
+        html_extras: true,
     };
     pub const NONE: Extensions = Extensions {
         vertical_tables: false,
@@ -115,6 +121,7 @@ impl Extensions {
         paragraph_placeholder: false,
         footnotes: false,
         full_tables: false,
+        html_extras: false,
     };
 }
 
@@ -274,6 +281,7 @@ impl PackageTemplate {
         let mut out: Vec<(String, Cow<[u8]>)> = Vec::with_capacity(self.parts.len());
         let mut media: Vec<(String, MediaUse)> = Vec::new();
         let mut notes = Vec::new();
+        let mut links: Vec<(String, Vec<String>)> = Vec::new();
         for (name, part) in &self.parts {
             let bytes = match part {
                 PackagePart::Bytes(bytes) => Cow::Borrowed(bytes.as_slice()),
@@ -283,6 +291,9 @@ impl PackageTemplate {
                     if name == DOCUMENT_PART {
                         notes = filled.footnotes;
                     }
+                    if !filled.links.is_empty() {
+                        links.push((name.clone(), filled.links));
+                    }
                     let xml = if self.drop_empty_last_page && name == DOCUMENT_PART { drop_empty_last_page(&filled.xml) } else { filled.xml };
                     Cow::Owned(xml.into_bytes())
                 }
@@ -290,6 +301,7 @@ impl PackageTemplate {
             out.push((name.clone(), bytes));
         }
         add_media(&mut out, &media);
+        add_links(&mut out, &links);
         footnotes::add_footnotes(&mut out, &notes);
         self.document.apply(&mut out);
         out
@@ -306,21 +318,8 @@ fn add_media(parts: &mut Vec<(String, Cow<[u8]>)>, media: &[(String, MediaUse)])
             parts.push((path, Cow::Owned(used.image.bytes.to_vec())));
         }
 
-        let file = &part[folder.len()..];
-        let rels_path = format!("{folder}_rels/{file}.rels");
         let relationship = format!("<Relationship Id=\"{}\" Type=\"{IMAGE_RELATIONSHIP}\" Target=\"{}\"/>", used.relationship_id, used.target);
-        let rels = match parts.iter().position(|(name, _)| *name == rels_path) {
-            Some(index) => &mut parts[index].1,
-            None => {
-                let empty = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{RELATIONSHIPS_NAMESPACE}\"></Relationships>");
-                parts.push((rels_path, Cow::Owned(empty.into_bytes())));
-                &mut parts.last_mut().expect("just pushed").1
-            }
-        };
-        let xml = String::from_utf8_lossy(rels).into_owned();
-        if !xml.contains(&format!("Id=\"{}\"", used.relationship_id)) {
-            *rels = Cow::Owned(insert_before_last(&xml, "</Relationships>", &relationship).into_bytes());
-        }
+        add_relationship(parts, part, &used.relationship_id, &relationship);
 
         let Some(types) = parts.iter_mut().find(|(name, _)| name == CONTENT_TYPES_PART) else { continue };
         let xml = String::from_utf8_lossy(&types.1).into_owned();
@@ -329,6 +328,38 @@ fn add_media(parts: &mut Vec<(String, Cow<[u8]>)>, media: &[(String, MediaUse)])
             let default = format!("<Default Extension=\"{extension}\" ContentType=\"{}\"/>", image_content_type(&extension));
             types.1 = Cow::Owned(insert_before_last(&xml, "</Types>", &default).into_bytes());
         }
+    }
+}
+
+/// Each part's external links, as relationships its hyperlinks name.
+fn add_links(parts: &mut Vec<(String, Cow<[u8]>)>, links: &[(String, Vec<String>)]) {
+    for (part, addresses) in links {
+        for (index, address) in addresses.iter().enumerate() {
+            let id = rich_text::link_relationship_id(index);
+            let mut target = String::new();
+            xml::escape(address, &mut target);
+            let relationship = format!("<Relationship Id=\"{id}\" Type=\"{HYPERLINK_RELATIONSHIP}\" Target=\"{target}\" TargetMode=\"External\"/>");
+            add_relationship(parts, part, &id, &relationship);
+        }
+    }
+}
+
+/// Adds `relationship` to `part`'s relationships part, creating it when missing, unless one
+/// with `id` is there.
+fn add_relationship(parts: &mut Vec<(String, Cow<[u8]>)>, part: &str, id: &str, relationship: &str) {
+    let folder = part.rfind('/').map_or("", |at| &part[..at + 1]);
+    let rels_path = format!("{folder}_rels/{}.rels", &part[folder.len()..]);
+    let rels = match parts.iter().position(|(name, _)| *name == rels_path) {
+        Some(index) => &mut parts[index].1,
+        None => {
+            let empty = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{RELATIONSHIPS_NAMESPACE}\"></Relationships>");
+            parts.push((rels_path, Cow::Owned(empty.into_bytes())));
+            &mut parts.last_mut().expect("just pushed").1
+        }
+    };
+    let xml = String::from_utf8_lossy(rels).into_owned();
+    if !xml.contains(&format!("Id=\"{id}\"")) {
+        *rels = Cow::Owned(insert_before_last(&xml, "</Relationships>", relationship).into_bytes());
     }
 }
 
