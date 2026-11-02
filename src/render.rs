@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::properties::edit_each;
 use crate::styling::{Style, read_style, style_cell, style_paragraph, style_row, style_run};
 use crate::table_merge::{Merge, merge_table};
+use crate::full_table::{Grid, write_table};
 use crate::images::{Image, MediaUse, body_or_default, drawing_size, drawing_xml};
 use crate::rich_text::{self, RichValue};
 use crate::template::{BlockKind, Part, StyleTarget, TagKind, Template};
@@ -137,6 +138,40 @@ impl<'a> Render<'a, '_> {
                         self.out.push_str(&print_value(value));
                     }
                 }
+                BlockKind::FullTable { name, is_in_cell } => {
+                    if let Some(value) = look_up(scopes, name) {
+                        let body = body_or_default(self.template.body.or(self.state.body));
+                        self.out.push_str(&write_table(value, body, *is_in_cell));
+                    }
+                }
+                BlockKind::Grid { name } => {
+                    let body = body_or_default(self.template.body.or(self.state.body));
+                    let Some(grid) = look_up(scopes, name).and_then(|value| Grid::read(value, body)) else { continue };
+                    let columns = grid.columns();
+                    for (index, items) in grid.items.chunks(grid.rows * columns).enumerate() {
+                        grid.write_table_start(&mut self.out, index);
+                        for row in items.chunks(columns) {
+                            grid.write_row_start(&mut self.out);
+                            for column in 0..columns {
+                                grid.write_cell_start(&mut self.out, column);
+                                let before = self.out.len();
+                                if let Some(item) = row.get(column) {
+                                    scopes.push(item);
+                                    self.render_range(block.body_start, block.body_end, &block.children, scopes);
+                                    scopes.pop();
+                                }
+                                // A cell must hold a paragraph.
+                                if !self.out[before..].contains("<w:p") {
+                                    self.out.push_str("<w:p/>");
+                                }
+                                self.out.push_str("</w:tc>");
+                            }
+                            self.out.push_str("</w:tr>");
+                        }
+                        self.out.push_str("</w:tbl>");
+                    }
+                    grid.write_end(&mut self.out);
+                }
                 BlockKind::Placeholder { names } => {
                     let values: Vec<Option<&Value>> = names.iter().map(|name| look_up(scopes, name)).collect();
                     if !values.iter().all(|value| is_shown(*value)) {
@@ -250,7 +285,7 @@ impl<'a> Render<'a, '_> {
                             }
                         }
                         TagKind::Image { cell_width } => self.print_image(value(), cell_width),
-                        TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close => {}
+                        TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close | TagKind::FullTable | TagKind::GridOpen => {}
                     }
                 }
             }

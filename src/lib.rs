@@ -17,6 +17,7 @@ mod cell_styling;
 mod document_edits;
 mod empty_last_page;
 mod footnotes;
+mod full_table;
 mod images;
 mod properties;
 mod render;
@@ -85,6 +86,9 @@ pub struct Extensions {
     pub paragraph_placeholder: bool,
     /// `{:footnote name}`: a footnote holding the value, in the body only.
     pub footnotes: bool,
+    /// `{:table name}` builds a table from data in place of its paragraph; `{:#grid name}` …
+    /// `{:/grid}` prints the paragraphs between them once per item, in a grid of cells.
+    pub full_tables: bool,
 }
 
 impl Extensions {
@@ -98,6 +102,7 @@ impl Extensions {
         word_run: true,
         paragraph_placeholder: true,
         footnotes: true,
+        full_tables: true,
     };
     pub const NONE: Extensions = Extensions {
         vertical_tables: false,
@@ -109,6 +114,7 @@ impl Extensions {
         word_run: false,
         paragraph_placeholder: false,
         footnotes: false,
+        full_tables: false,
     };
 }
 

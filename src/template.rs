@@ -49,6 +49,10 @@ pub(crate) enum TagKind {
     Placeholder,
     /// `{:footnote name}`: a footnote holding the value.
     Footnote,
+    /// `{:table name}`: a table built from the value, in place of the tag's paragraph.
+    FullTable,
+    /// `{:#grid name}`: the paragraphs up to `{:/grid}` printed once per item in a grid of cells.
+    GridOpen,
 }
 
 /// What a styling tag styles.
@@ -80,6 +84,10 @@ pub(crate) enum BlockKind {
     Raw { name: String },
     /// A paragraph holding `{?name}` tags, printed by their values.
     Placeholder { names: Vec<String> },
+    /// A `{:table}` tag's paragraph.
+    FullTable { name: String, is_in_cell: bool },
+    /// A grid's tag paragraphs and the paragraphs between them, the body.
+    Grid { name: String },
 }
 
 /// A range of parts a loop or raw tag replaces: `start..end` is printed as `body_start..body_end`
@@ -240,6 +248,7 @@ impl Template {
         match &self.blocks[block].kind {
             BlockKind::Loop { name, .. } | BlockKind::Raw { name } => name,
             BlockKind::Placeholder { names } => names.first().map_or("", String::as_str),
+            BlockKind::FullTable { name, .. } | BlockKind::Grid { name } => name,
         }
     }
 }
@@ -386,6 +395,17 @@ fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
 }
 
 fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, String)> {
+    if extensions.full_tables {
+        if let Some(name) = text.strip_prefix(":table ") {
+            return Some((TagKind::FullTable, name.trim().to_string()));
+        }
+        if let Some(name) = text.strip_prefix(":#grid ") {
+            return Some((TagKind::GridOpen, name.trim().to_string()));
+        }
+        if text.trim() == ":/grid" {
+            return Some((TagKind::Close, String::new()));
+        }
+    }
     if extensions.table_merge {
         for (prefix, is_columns) in [(":merge-cells-col", true), (":merge-cells-row", false)] {
             let Some(rest) = text.strip_prefix(prefix) else { continue };
@@ -489,13 +509,17 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
     let mut open: Vec<usize> = Vec::new();
     for (index, tag) in tags.iter().enumerate() {
         match tag.kind {
-            TagKind::Open { .. } => open.push(index),
+            TagKind::Open { .. } | TagKind::GridOpen => open.push(index),
             TagKind::Close => {
                 let Some(opening) = open.pop() else {
                     return Err(FillError::new(format!("The tag \"{}\" has no opening loop tag", tag.text)));
                 };
                 if !tag.name.is_empty() && tag.name != tags[opening].name {
                     return Err(FillError::new(format!("The tag \"{}\" is closed by the tag \"{}\"", tags[opening].name, tag.name)));
+                }
+                if tags[opening].kind == TagKind::GridOpen {
+                    blocks.push(expand_grid(tags, paragraphs, opening, index)?);
+                    continue;
                 }
                 blocks.push(expand_loop(parts, tags, paragraphs, opening, index, options)?);
             }
@@ -504,6 +528,21 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                 let (start, end) = find_enclosing(parts, tag.part, element).ok_or_else(|| not_inside(tag, element))?;
                 blocks.push(Block {
                     kind: BlockKind::Raw { name: tag.name.clone() },
+                    start,
+                    end: end + 1,
+                    body_start: end + 1,
+                    body_end: end + 1,
+                    children: Vec::new(),
+                    open_tag: index,
+                });
+            }
+            TagKind::FullTable => {
+                if !tag.is_alone {
+                    return Err(FillError::new(format!("The table tag \"{}\" should be the only text in its paragraph", tag.text)));
+                }
+                let (start, end) = find_enclosing(parts, tag.part, PARAGRAPH).ok_or_else(|| not_inside(tag, PARAGRAPH))?;
+                blocks.push(Block {
+                    kind: BlockKind::FullTable { name: tag.name.clone(), is_in_cell: find_enclosing(parts, tag.part, CELL).is_some() },
                     start,
                     end: end + 1,
                     body_start: end + 1,
@@ -543,6 +582,24 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
         return Err(FillError::new(format!("The loop with tag \"{}\" is unclosed", tags[opening].name)));
     }
     Ok(blocks)
+}
+
+/// A grid's parts: its tags' paragraphs, each holding only its tag, and the paragraphs between.
+fn expand_grid(tags: &[Tag], paragraphs: &[Paragraph], opening: usize, closing: usize) -> Result<Block, FillError> {
+    let (open, close) = (&tags[opening], &tags[closing]);
+    let (first, last) = (&paragraphs[open.paragraph], &paragraphs[close.paragraph]);
+    if open.paragraph == close.paragraph || !open.is_alone || !close.is_alone || first.end <= first.start || last.end <= last.start {
+        return Err(FillError::new(format!("The grid tags \"{}\" should each be alone in their own paragraph", open.name)));
+    }
+    Ok(Block {
+        kind: BlockKind::Grid { name: open.name.clone() },
+        start: first.start,
+        end: last.end + 1,
+        body_start: first.end + 1,
+        body_end: last.start,
+        children: Vec::new(),
+        open_tag: opening,
+    })
 }
 
 /// The parts a loop repeats:
