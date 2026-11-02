@@ -8,7 +8,7 @@ use crate::rich_text::{self, RichValue};
 use crate::template::{BlockKind, Part, TagKind, Template};
 use crate::xml::{ElementKind, escape};
 
-// A `\n` in a value: the text run continues after a line break.
+// A `\n` in a value outside a run: the text continues after a line break.
 const LINE_BREAK: &str = "</w:t><w:br/><w:t xml:space=\"preserve\">";
 const PARAGRAPH: &str = "w:p";
 const CELL: &str = "w:tc";
@@ -161,7 +161,7 @@ impl<'a> Render<'a, '_> {
                     match tag.kind {
                         TagKind::Value => {
                             if let Some(value) = value() {
-                                self.print_text(&print_value(value));
+                                self.print_text(&print_value(value), tag.run_props.as_deref());
                             }
                         }
                         TagKind::Module(module) => {
@@ -232,14 +232,23 @@ impl<'a> Render<'a, '_> {
         }
     }
 
-    fn print_text(&mut self, text: &str) {
+    /// Prints a value. With line breaks on, each `\n` ends the tag's run, adds a run holding a
+    /// break and goes on in a run with the tag run's properties.
+    fn print_text(&mut self, text: &str, run_props: Option<&str>) {
         if !self.template.linebreaks || !text.contains('\n') {
             escape(text, &mut self.out);
             return;
         }
         for (index, line) in text.split('\n').enumerate() {
             if index > 0 {
-                self.out.push_str(LINE_BREAK);
+                match run_props {
+                    Some(props) => {
+                        self.out.push_str("</w:t></w:r><w:r><w:br/></w:r><w:r>");
+                        self.out.push_str(props);
+                        self.out.push_str("<w:t xml:space=\"preserve\">");
+                    }
+                    None => self.out.push_str(LINE_BREAK),
+                }
             }
             escape(line.strip_suffix('\r').unwrap_or(line), &mut self.out);
         }

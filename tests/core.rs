@@ -56,10 +56,13 @@ fn escapes_values() {
 }
 
 #[test]
-fn prints_a_newline_as_a_line_break_in_the_same_run() {
+fn prints_a_newline_as_a_break_run_between_runs_formatted_as_the_tags() {
     let body = fill(r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>{v}</w:t></w:r></w:p>"#, json!({ "v": "one\ntwo" }));
 
-    assert_eq!(body, r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">one</w:t><w:br/><w:t xml:space="preserve">two</w:t></w:r></w:p>"#);
+    assert_eq!(
+        body,
+        r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">one</w:t></w:r><w:r><w:br/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">two</w:t></w:r></w:p>"#
+    );
 }
 
 #[test]

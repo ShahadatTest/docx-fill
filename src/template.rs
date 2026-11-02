@@ -7,6 +7,8 @@ const PARAGRAPH: &str = "w:p";
 const TEXT: &str = "w:t";
 const CELL: &str = "w:tc";
 const ROW: &str = "w:tr";
+const RUN: &str = "w:r";
+const RUN_PROPS: &str = "w:rPr";
 const PRESERVE_SPACE: &str = " xml:space=\"preserve\"";
 // Word lengths are twentieths of a point; pixels are 1/96 inch.
 pub(crate) const PX_PER_TWIP: f64 = 96.0 / 1440.0;
@@ -48,6 +50,9 @@ pub(crate) struct Tag {
     pub paragraph: usize,
     /// Nothing else is in its paragraph's text.
     pub is_alone: bool,
+    /// A value tag's `<w:rPr>`, empty when its run has none; `None` outside a run or without
+    /// line breaks.
+    pub run_props: Option<String>,
 }
 
 #[derive(Debug)]
@@ -166,8 +171,10 @@ impl Template {
         }
 
         for tag in &mut tags {
-            if let TagKind::Image { cell_width } = &mut tag.kind {
-                *cell_width = read_cell_width(&parts, tag.part);
+            match &mut tag.kind {
+                TagKind::Image { cell_width } => *cell_width = read_cell_width(&parts, tag.part),
+                TagKind::Value if options.linebreaks => tag.run_props = read_run_props(&parts, tag.part),
+                _ => {}
             }
         }
 
@@ -232,7 +239,7 @@ impl Builder {
             if tag.start >= offset {
                 let written = &joined[tag.start + options.delimiters.start.len()..tag.end - options.delimiters.end.len()];
                 let (kind, name) = read_tag(&unescape(written), options);
-                self.tags.push(Tag { kind, name, text: written.to_string(), part: self.parts.len(), paragraph, is_alone: false });
+                self.tags.push(Tag { kind, name, text: written.to_string(), part: self.parts.len(), paragraph, is_alone: false, run_props: None });
                 self.parts.push(Part::Tag(self.tags.len() - 1));
             }
             cursor = tag.end.min(end);
@@ -402,6 +409,25 @@ fn read_cell_width(parts: &[Part], at: usize) -> Option<f64> {
         }
     }
     None
+}
+
+/// The raw `<w:rPr>` opening the run around part `at`, empty when there is none.
+fn read_run_props(parts: &[Part], at: usize) -> Option<String> {
+    let (start, _) = find_enclosing(parts, at, RUN)?;
+    let mut props = String::new();
+    for part in &parts[start + 1..at] {
+        let Part::Element { kind, name, raw } = part else { break };
+        match (kind, name.as_str()) {
+            (ElementKind::SelfClosing, RUN_PROPS) => return Some(String::new()),
+            (ElementKind::Close, RUN_PROPS) => {
+                props.push_str(raw);
+                return Some(props);
+            }
+            _ if props.is_empty() && name != RUN_PROPS => break,
+            _ => props.push_str(raw),
+        }
+    }
+    Some(String::new())
 }
 
 /// Pairs each loop's tags and works out the parts every loop and raw tag replaces.
