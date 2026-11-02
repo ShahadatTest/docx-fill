@@ -24,6 +24,8 @@ Extensions, each on or off in `FillOptions::extensions`:
 
 `FilledDocument` works on a filled package's body text: `search` finds text within a paragraph (`\n` matches a line break, `\t` a tab), `replace` and `replace_all` change it in the run of its first character, `add_comment` puts a Word comment around a found range, and `comments` lists each comment with the text and XML it marks. Positions are a paragraph index and a character offset, not docxtemplater's XML token index.
 
+For callers that pass settings as JSON, such as a wasm build: `FillOptions::read_json` reads every option (camelCase keys, unknown keys refused), `read_include_options` a subtemplate's mode and styles, and `FilledDocument::run_json` a list of text edits.
+
 ```rust
 let template = docx_fill::PackageTemplate::parse(parts, &docx_fill::FillOptions::default())?;
 let filled = template.render(&serde_json::json!({ "name": "Value" }));
