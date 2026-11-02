@@ -382,6 +382,7 @@ fn preserve_space(raw: &str) -> String {
 /// The tags in a paragraph's joined text.
 fn find_tags(text: &str, delimiters: &Delimiters) -> Result<Vec<FoundTag>, FillError> {
     let (start, end) = (delimiters.start.as_str(), delimiters.end.as_str());
+    let identical = start == end;
     let mut tags = Vec::new();
     let mut open = None;
     let mut at = 0;
@@ -389,11 +390,19 @@ fn find_tags(text: &str, delimiters: &Delimiters) -> Result<Vec<FoundTag>, FillE
         let rest = &text[at..];
         if rest.starts_with(start) {
             if let Some(opened) = open {
-                return Err(unclosed_tag(&text[opened..at]));
+                // Same start and end (e.g. `%name%`): the next delimiter closes the tag.
+                if identical {
+                    at += start.len();
+                    tags.push(FoundTag { start: opened, end: at });
+                    open = None;
+                } else {
+                    return Err(unclosed_tag(&text[opened..at]));
+                }
+            } else {
+                open = Some(at);
+                at += start.len();
             }
-            open = Some(at);
-            at += start.len();
-        } else if rest.starts_with(end) {
+        } else if !identical && rest.starts_with(end) {
             let Some(opened) = open.take() else {
                 let context_start = tags.last().map_or(0, |tag: &FoundTag| tag.end);
                 return Err(FillError::new(format!("The tag beginning with \"{}\" is unopened", unescape(&text[context_start..at]))));

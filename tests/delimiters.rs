@@ -30,3 +30,17 @@ fn rejects_an_unclosed_tag() {
 fn fills_tags_between_doubled_braces() {
     assert_eq!(fill_with(&paragraph(&["{{name}}"]), "{{", "}}").unwrap(), "N");
 }
+
+#[test]
+fn fills_tags_when_start_and_end_delimiter_are_the_same() {
+    assert_eq!(fill_with(&paragraph(&["%name%"]), "%", "%").unwrap(), "N");
+}
+
+#[test]
+fn fills_several_same_delimiter_tags_in_one_paragraph() {
+    let options = FillOptions { delimiters: Delimiters { start: "%".into(), end: "%".into() }, ..FillOptions::default() };
+    let xml = fill_part(&document(&paragraph(&["%a% and %b%"])), &json!({ "a": "one", "b": "two" }), &options)
+        .map(|xml| text(&xml))
+        .unwrap();
+    assert_eq!(xml, "one and two");
+}
