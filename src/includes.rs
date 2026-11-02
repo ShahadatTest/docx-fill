@@ -105,10 +105,10 @@ pub(crate) fn print_includes(parts: &mut Vec<(String, Cow<[u8]>)>, uses: &[(Stri
 
 /// The header and footer references of a subtemplate's last section, with the parts they name
 /// copied into the package under the body's new relationships, and whether the section has a
-/// first-page header. Styles they use and the main document lacks are copied too.
+/// first-page header. The styles and lists they use are imported as for a body include.
 pub(crate) fn import_section_headers(parts: &mut Vec<(String, Cow<[u8]>)>, include: &Subtemplate, name: &str, scope: &Value, hooks: &mut dyn FillHooks, count: usize) -> (String, bool) {
     let rendered = include.render(scope, hooks);
-    let mut import = Import { parts, part: DOCUMENT_PART, from: &rendered, count, name, styles: IncludeStyles::UseMain, copied: BTreeMap::new() };
+    let mut import = Import { parts, part: DOCUMENT_PART, from: &rendered, count, name, styles: include.styles, copied: BTreeMap::new() };
     let document = import.read_from(DOCUMENT_PART);
     let Some(section) = find_starts(&document, "w:sectPr").last().and_then(|&start| find_element_end(&document, start, "w:sectPr").map(|end| &document[start..end])) else {
         return (String::new(), false);
@@ -128,10 +128,18 @@ pub(crate) fn import_section_headers(parts: &mut Vec<(String, Cow<[u8]>)>, inclu
         _ => Edit::Keep,
     });
 
-    let headers: String = import.copied.values().filter(|name| !name.contains("/_rels/")).map(|name| import.read_main(name).unwrap_or_default()).collect();
+    let copied: Vec<String> = import.copied.values().filter(|name| name.ends_with(".xml")).cloned().collect();
+    let headers: String = copied.iter().map(|name| import.read_main(name).unwrap_or_default()).collect();
     let definitions = read_styles(&import.read_from(STYLES_PART));
     let used = read_style_closure(&headers, &definitions);
-    import.import_styles(&used, &definitions, &BTreeMap::new());
+    let numbered: String = used.iter().filter_map(|id| definitions.get(id).map(String::as_str)).collect();
+    let numbers = import.import_numbering(&format!("{headers}{numbered}"));
+    let styles = import.import_styles(&used, &definitions, &numbers);
+    for part in copied {
+        let Some(xml) = import.read_main(&part) else { continue };
+        let renamed = edit_attributes(&xml, |element, attribute, value| rename_reference(element, attribute, value, &BTreeMap::new(), &styles, &numbers));
+        import.write_main(&part, renamed);
+    }
     (references, is_title_page)
 }
 

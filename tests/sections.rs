@@ -96,3 +96,26 @@ fn drops_the_tag_for_a_missing_or_unknown_value() {
         assert_eq!(xml.matches("<w:sectPr").count(), 1);
     }
 }
+
+#[test]
+fn renames_the_styles_and_lists_its_headers_use() {
+    let options = FillOptions::default();
+    let mut main = main_parts(&body("{:subsection doc}"));
+    let main_styles = r#"<w:styles xmlns:w="w"><w:style w:type="paragraph" w:styleId="SubHeader"><w:name w:val="Sub header"/><w:rPr><w:b/></w:rPr></w:style></w:styles>"#;
+    main.iter_mut().find(|(name, _)| name == "word/styles.xml").unwrap().1 = main_styles.as_bytes().to_vec();
+
+    let mut sub = sub_parts();
+    let header = r#"<w:hdr xmlns:w="w"><w:p><w:pPr><w:pStyle w:val="SubHeader"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="3"/></w:numPr></w:pPr><w:r><w:t>Sub</w:t></w:r></w:p></w:hdr>"#;
+    sub.iter_mut().find(|(name, _)| name == "word/header3.xml").unwrap().1 = header.as_bytes().to_vec();
+    let numbering = r#"<w:numbering xmlns:w="w"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+    sub.push(("word/numbering.xml".to_string(), numbering.as_bytes().to_vec()));
+
+    let mut template = PackageTemplate::parse(main, &options).unwrap();
+    template.add_include("sub", Subtemplate::parse(sub, &options, IncludeMode::Templated, IncludeStyles::KeepOwn).unwrap());
+    let parts: Vec<(String, String)> = template.render(&json!({ "doc": "sub" })).into_iter().map(|(name, bytes)| (name, String::from_utf8(bytes.into_owned()).unwrap())).collect();
+
+    let header = part(&parts, "word/docx_fill_include1_header3.xml");
+    assert!(header.contains(r#"<w:pStyle w:val="SubHeadersub"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#), "{header}");
+    assert!(part(&parts, "word/styles.xml").contains(r#"<w:style w:type="paragraph" w:styleId="SubHeadersub"><w:name w:val="Sub header (sub)"/>"#));
+    assert!(part(&parts, "word/numbering.xml").contains(r#"<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>"#));
+}

@@ -29,6 +29,7 @@ mod rich_text;
 mod styling;
 mod table_merge;
 mod template;
+mod text;
 mod xml;
 
 use std::borrow::Cow;
@@ -45,6 +46,7 @@ pub use images::Image;
 pub use includes::{IncludeMode, IncludeStyles, Subtemplate};
 pub use render::{FillHooks, ModuleTag, NoHooks};
 pub use template::Template;
+pub use text::{CommentedText, FilledDocument, TextPosition, TextRange};
 
 use images::MediaUse;
 use render::FillState;

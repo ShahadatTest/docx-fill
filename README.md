@@ -16,11 +16,13 @@ Extensions, each on or off in `FillOptions::extensions`:
 - `{:table name}` builds a table from data; `{:#grid name}` … `{:/grid}` prints its paragraphs once per item in a grid of cells.
 - `{%image}` and `{%%image}` draw an image a `FillHooks::image` hook supplies, sized to its table cell or the page, adding its media part, relationship and content type. With `centered_images`, `{%%image}` alone in its paragraph centres it.
 - `{:include name}` prints the bodies of subtemplates added with `PackageTemplate::add_include`, as given or filled with the tag's scope. Their styles (the main document's win, or `IncludeStyles::KeepOwn` renames clashes), lists (one the main document has level by level continues there), media, links, footnotes and the parts copied parts relate to, such as a chart's workbook, come along; section properties, comments and endnotes do not. `{:segment name}` … `{:segment/}` defines a segment printed only by `{:includesegment name}` or `{:includesegment* expression}`; `{:inlinesegment}` and `{:includeinlinesegment}` do the same inside a paragraph.
-- `{:subsection name}` starts a section with a subtemplate's headers and footers; `{:replacesection name}` gives them to the tag's section; `{:page props}` sets its orientation, size and margins.
+- `{:subsection name}` starts a section with a subtemplate's headers and footers; `{:replacesection name}` gives them to the tag's section. The styles and lists those headers use come along as for `{:include}`. `{:page props}` sets its orientation, size and margins.
 - A value `{ "text": …, "comment": … }` (or `"comments": [...]`) prints its text with Word comments on it, with `FillOptions::comments` as the default author.
 - An empty last page left by a loop that printed nothing is dropped.
 
 `FillOptions::document` edits the whole package: read-only or password protection (the hash Word checks: legacy key, then SHA-1/256/384/512 with salt and spin count), a text watermark in every header, page margins and the default proofing language.
+
+`FilledDocument` works on a filled package's body text: `search` finds text within a paragraph (`\n` matches a line break, `\t` a tab), `replace` and `replace_all` change it in the run of its first character, `add_comment` puts a Word comment around a found range, and `comments` lists each comment with the text and XML it marks. Positions are a paragraph index and a character offset, not docxtemplater's XML token index.
 
 ```rust
 let template = docx_fill::PackageTemplate::parse(parts, &docx_fill::FillOptions::default())?;
