@@ -14,6 +14,7 @@
 //! Built from the WordprocessingML spec and docxtemplater's documented behaviour.
 
 mod cell_styling;
+mod comments;
 mod document_edits;
 mod empty_last_page;
 mod footnotes;
@@ -21,6 +22,8 @@ mod full_table;
 mod images;
 mod includes;
 mod properties;
+mod sections;
+mod protection;
 mod render;
 mod rich_text;
 mod styling;
@@ -34,8 +37,10 @@ use std::fmt;
 
 use serde_json::Value;
 
-pub use document_edits::{DocumentEdits, Margins};
+pub use document_edits::{DocumentEdits, Margins, Watermark, WatermarkLayout};
+pub use protection::{HashAlgorithm, Protection, ProtectionKind};
 pub use empty_last_page::drop_empty_last_page;
+pub use comments::CommentDefaults;
 pub use images::Image;
 pub use includes::{IncludeMode, IncludeStyles, Subtemplate};
 pub use render::{FillHooks, ModuleTag, NoHooks};
@@ -107,6 +112,16 @@ pub struct Extensions {
     /// `{:includesegment* expression}` names it; `{:inlinesegment name}` …
     /// `{:inlinesegment/}` and `{:includeinlinesegment name}` do the same within a paragraph.
     pub subtemplates: bool,
+    /// A value tag whose value is `{ "text": …, "comment": … }` or `{ "text": …, "comments":
+    /// [{ "comment": …, "author": …, "date": … }] }` prints the text with Word comments on it, in
+    /// the body. [`FillOptions::comments`] gives the author and date a value leaves out.
+    pub comments: bool,
+    /// In the body, `{:subsection name}` ends the section before its paragraph, and the rest of
+    /// the section takes the headers and footers of the subtemplate the value names;
+    /// `{:replacesection name}` gives them to the whole section. `{:page props}` sets the
+    /// section's `orientation` (`portrait`, `landscape`), `size` (`A4`, `Letter`, … or
+    /// `[width, height]` in twips) and `margins` (`top`, `left`, … in twips).
+    pub sections: bool,
 }
 
 impl Extensions {
@@ -124,6 +139,8 @@ impl Extensions {
         html_extras: true,
         centered_images: true,
         subtemplates: true,
+        comments: true,
+        sections: true,
     };
     pub const NONE: Extensions = Extensions {
         vertical_tables: false,
@@ -139,6 +156,8 @@ impl Extensions {
         html_extras: false,
         centered_images: false,
         subtemplates: false,
+        comments: false,
+        sections: false,
     };
 }
 
@@ -162,6 +181,7 @@ pub struct FillOptions {
     pub document: DocumentEdits,
     /// Drops the paragraphs holding `{::stylepar}` tags.
     pub drop_style_paragraphs: bool,
+    pub comments: CommentDefaults,
 }
 
 impl Default for FillOptions {
@@ -177,6 +197,7 @@ impl Default for FillOptions {
             module_prefixes: Vec::new(),
             document: DocumentEdits::default(),
             drop_style_paragraphs: false,
+            comments: CommentDefaults::default(),
         }
     }
 }
@@ -236,6 +257,7 @@ pub struct PackageTemplate {
     document: DocumentEdits,
     max_drawing_id: u32,
     max_footnote_id: u32,
+    max_comment_id: Option<u32>,
     body: Option<(f64, f64)>,
     includes: BTreeMap<String, Subtemplate>,
 }
@@ -249,6 +271,7 @@ enum PackagePart {
 impl PackageTemplate {
     /// Parses the body, headers and footers among `parts`, given by name without a leading `/`.
     pub fn parse(parts: impl IntoIterator<Item = (String, Vec<u8>)>, options: &FillOptions) -> Result<PackageTemplate, FillError> {
+        options.document.check()?;
         let mut parsed = Vec::new();
         for (name, bytes) in parts {
             if !is_template_part(&name) {
@@ -275,7 +298,12 @@ impl PackageTemplate {
             PackagePart::Bytes(bytes) if name == footnotes::FOOTNOTES_PART => Some(footnotes::read_max_id(&String::from_utf8_lossy(bytes))),
             _ => None,
         });
+        let max_comment_id = parsed.iter().find_map(|(name, part)| match part {
+            PackagePart::Bytes(bytes) if name == comments::COMMENTS_PART => Some(comments::read_max_id(&String::from_utf8_lossy(bytes))),
+            _ => None,
+        });
         Ok(PackageTemplate {
+            max_comment_id,
             drop_empty_last_page: options.drop_empty_last_page,
             document: options.document.clone(),
             max_drawing_id,
@@ -305,13 +333,16 @@ impl PackageTemplate {
             body: self.body,
             container_fill: CONTAINER_FILL,
             next_footnote_id: self.max_footnote_id + 1,
+            next_comment_id: self.max_comment_id.map_or(0, |id| id + 1),
         };
+        let mut comments = Vec::new();
         let mut out: Vec<(String, Cow<[u8]>)> = Vec::with_capacity(self.parts.len());
         let mut media: Vec<(String, MediaUse)> = Vec::new();
         let mut notes = Vec::new();
         let mut links: Vec<(String, Vec<String>)> = Vec::new();
         let mut definitions = Vec::new();
         let mut includes = Vec::new();
+        let mut sections = Vec::new();
         for (name, part) in &self.parts {
             let bytes = match part {
                 PackagePart::Bytes(bytes) => Cow::Borrowed(bytes.as_slice()),
@@ -320,6 +351,8 @@ impl PackageTemplate {
                     media.extend(filled.media.into_iter().map(|used| (name.clone(), used)));
                     if name == DOCUMENT_PART {
                         notes = filled.footnotes;
+                        comments = filled.comments;
+                        sections = filled.sections;
                     }
                     definitions.extend(filled.style_definitions);
                     if !filled.includes.is_empty() {
@@ -338,7 +371,9 @@ impl PackageTemplate {
         add_links(&mut out, &links);
         restyle_definitions(&mut out, &definitions);
         footnotes::add_footnotes(&mut out, &notes);
-        includes::print_includes(&mut out, &includes, &self.includes, hooks);
+        comments::add_comments(&mut out, &comments);
+        let count = includes::print_includes(&mut out, &includes, &self.includes, hooks);
+        sections::apply_sections(&mut out, &sections, &self.includes, hooks, count);
         self.document.apply(&mut out);
         out
     }

@@ -68,7 +68,7 @@ impl Subtemplate {
         Ok(Subtemplate { parts, template, styles })
     }
 
-    fn render(&self, scope: &Value, hooks: &mut dyn FillHooks) -> Vec<(String, Cow<'_, [u8]>)> {
+    pub(crate) fn render(&self, scope: &Value, hooks: &mut dyn FillHooks) -> Vec<(String, Cow<'_, [u8]>)> {
         match &self.template {
             Some(template) => template.render_with(scope, hooks),
             None => self.parts.iter().map(|(name, bytes)| (name.clone(), Cow::Borrowed(bytes.as_slice()))).collect(),
@@ -78,7 +78,9 @@ impl Subtemplate {
 
 /// Prints each part's subtemplates at its include marks. A name with no subtemplate prints
 /// nothing.
-pub(crate) fn print_includes(parts: &mut Vec<(String, Cow<[u8]>)>, uses: &[(String, Vec<(String, Value)>)], includes: &BTreeMap<String, Subtemplate>, hooks: &mut dyn FillHooks) {
+///
+/// @returns How many includes printed, to number later imports after them.
+pub(crate) fn print_includes(parts: &mut Vec<(String, Cow<[u8]>)>, uses: &[(String, Vec<(String, Value)>)], includes: &BTreeMap<String, Subtemplate>, hooks: &mut dyn FillHooks) -> usize {
     let mut count = 0;
     for (part, used) in uses {
         let Some(index) = parts.iter().position(|(name, _)| name == part) else { continue };
@@ -98,6 +100,39 @@ pub(crate) fn print_includes(parts: &mut Vec<(String, Cow<[u8]>)>, uses: &[(Stri
         let xml = String::from_utf8_lossy(&parts[index].1).into_owned();
         parts[index].1 = Cow::Owned(replace_marks(&xml, &bodies).into_bytes());
     }
+    count
+}
+
+/// The header and footer references of a subtemplate's last section, with the parts they name
+/// copied into the package under the body's new relationships, and whether the section has a
+/// first-page header. Styles they use and the main document lacks are copied too.
+pub(crate) fn import_section_headers(parts: &mut Vec<(String, Cow<[u8]>)>, include: &Subtemplate, name: &str, scope: &Value, hooks: &mut dyn FillHooks, count: usize) -> (String, bool) {
+    let rendered = include.render(scope, hooks);
+    let mut import = Import { parts, part: DOCUMENT_PART, from: &rendered, count, name, styles: IncludeStyles::UseMain, copied: BTreeMap::new() };
+    let document = import.read_from(DOCUMENT_PART);
+    let Some(section) = find_starts(&document, "w:sectPr").last().and_then(|&start| find_element_end(&document, start, "w:sectPr").map(|end| &document[start..end])) else {
+        return (String::new(), false);
+    };
+    let is_title_page = find_starts(section, "w:titlePg").first().is_some_and(|&at| !section[at..].starts_with("<w:titlePg w:val=\"0\"") && !section[at..].starts_with("<w:titlePg w:val=\"false\""));
+
+    let mut references = String::new();
+    for element in ["w:headerReference", "w:footerReference"] {
+        for start in find_starts(section, element) {
+            let Some(end) = find_element_end(section, start, element) else { continue };
+            references.push_str(&section[start..end]);
+        }
+    }
+    let relationships = import.import_relationships(&references, DOCUMENT_PART);
+    let references = edit_attributes(&references, |_, attribute, value| match relationships.get(value) {
+        Some(renamed) if attribute == "r:id" => Edit::Set(renamed.clone()),
+        _ => Edit::Keep,
+    });
+
+    let headers: String = import.copied.values().filter(|name| !name.contains("/_rels/")).map(|name| import.read_main(name).unwrap_or_default()).collect();
+    let definitions = read_styles(&import.read_from(STYLES_PART));
+    let used = read_style_closure(&headers, &definitions);
+    import.import_styles(&used, &definitions, &BTreeMap::new());
+    (references, is_title_page)
 }
 
 fn replace_marks(xml: &str, bodies: &[String]) -> String {

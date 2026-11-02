@@ -10,7 +10,9 @@ use crate::images::{Image, MediaUse, body_or_default, drawing_size, drawing_xml}
 use crate::rich_text::{self, RichValue};
 use crate::template::{BlockKind, Part, StyleTarget, TagKind, Template};
 use crate::cell_styling;
+use crate::comments::{Comment, read_commented};
 use crate::includes::{INCLUDE_END, INCLUDE_START};
+use crate::sections::{SECTION_END, SECTION_START, SectionUse};
 use crate::xml::{ElementKind, escape, read_attribute};
 
 // A `\n` in a value outside a run: the text continues after a line break.
@@ -62,6 +64,7 @@ pub(crate) struct FillState {
     /// Images `{%name}` sizes to fill, as a share of their container's width.
     pub container_fill: f64,
     pub next_footnote_id: u32,
+    pub next_comment_id: u32,
 }
 
 /// A filled part and the media its drawings show.
@@ -76,6 +79,9 @@ pub(crate) struct FilledPart {
     pub style_definitions: Vec<(StyleKind, Option<String>, Style)>,
     /// Subtemplates to print at the include marks, by mark index: the name and the scope.
     pub includes: Vec<(String, Value)>,
+    pub comments: Vec<Comment>,
+    /// Section tags to apply at the section marks, by mark index.
+    pub sections: Vec<SectionUse>,
 }
 
 /// A paragraph open in the output.
@@ -104,6 +110,8 @@ struct Render<'a, 'h> {
     ranges: Vec<Style>,
     style_definitions: Vec<(StyleKind, Option<String>, Style)>,
     includes: Vec<(String, Value)>,
+    comments: Vec<Comment>,
+    sections: Vec<SectionUse>,
     segment_depth: usize,
     rich_values: Vec<RichValue>,
     media: Vec<MediaUse>,
@@ -120,7 +128,7 @@ impl Template {
     /// The part filled with `data`, asking `hooks` for module tags and images. An image's media
     /// part and relationship are not added: fill a [`crate::PackageTemplate`] for that.
     pub fn render_with(&self, data: &Value, hooks: &mut dyn FillHooks) -> String {
-        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1 };
+        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1, next_comment_id: 0 };
         let filled = self.fill(data, "", hooks, &mut state);
         // Only a package prints subtemplates.
         if filled.includes.is_empty() {
@@ -155,6 +163,8 @@ impl Template {
             ranges: Vec::new(),
             style_definitions: Vec::new(),
             includes: Vec::new(),
+            comments: Vec::new(),
+            sections: Vec::new(),
             segment_depth: 0,
             rich_values: Vec::new(),
             media: Vec::new(),
@@ -164,7 +174,7 @@ impl Template {
         let mut scopes = vec![data];
         render.render_range(0, self.parts.len(), &self.top, &mut scopes);
         let xml = if render.ranges.is_empty() { render.out } else { style_ranges(&render.out, &render.ranges) };
-        FilledPart { xml, media: render.media, footnotes: render.footnotes, links: render.links, style_definitions: render.style_definitions, includes: render.includes }
+        FilledPart { xml, media: render.media, footnotes: render.footnotes, links: render.links, style_definitions: render.style_definitions, includes: render.includes, comments: render.comments, sections: render.sections }
     }
 }
 
@@ -187,6 +197,14 @@ impl<'a> Render<'a, '_> {
                     }
                 }
                 BlockKind::Segment { .. } => {}
+                BlockKind::Section { name, tag } => {
+                    // Sections belong to the body; elsewhere the paragraph goes.
+                    let Some(value) = look_up(scopes, name).filter(|_| self.part == crate::DOCUMENT_PART) else { continue };
+                    self.out.push(SECTION_START);
+                    self.out.push_str(&self.sections.len().to_string());
+                    self.out.push(SECTION_END);
+                    self.sections.push(SectionUse { tag: *tag, value: value.clone(), scope: merge_scopes(scopes) });
+                }
                 BlockKind::IncludeSegment { name, is_dynamic } => {
                     let wanted = if *is_dynamic { look_up(scopes, name).and_then(Value::as_str) } else { Some(name.as_str()) };
                     let segment = wanted.and_then(|wanted| template.blocks.iter().find(|each| matches!(&each.kind, BlockKind::Segment { name } if name == wanted)));
@@ -310,8 +328,11 @@ impl<'a> Render<'a, '_> {
                     let value = || look_up(scopes, &tag.name);
                     match tag.kind {
                         TagKind::Value => {
-                            if let Some(value) = value() {
-                                self.print_text(&print_value(value), tag.run_props.as_deref());
+                            let Some(value) = value() else { continue };
+                            let commented = self.template.comment_defaults.as_ref().and_then(|defaults| read_commented(value, defaults));
+                            match commented {
+                                Some((text, comments)) => self.print_commented(&text, comments, tag.run_props.as_deref()),
+                                None => self.print_text(&print_value(value), tag.run_props.as_deref()),
                             }
                         }
                         TagKind::Module(module) => {
@@ -374,7 +395,7 @@ impl<'a> Render<'a, '_> {
                         }
                         TagKind::Image { cell_width, is_centered } => self.print_image(value(), cell_width, is_centered),
                         TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close | TagKind::FullTable | TagKind::GridOpen => {}
-                        TagKind::Include | TagKind::SegmentOpen { .. } | TagKind::IncludeSegment { .. } => {}
+                        TagKind::Include | TagKind::SegmentOpen { .. } | TagKind::IncludeSegment { .. } | TagKind::Section(_) => {}
                     }
                 }
             }
@@ -476,6 +497,36 @@ impl<'a> Render<'a, '_> {
         self.state.next_footnote_id += 1;
         self.out.push_str(&format!("</w:t></w:r><w:r>{SUPERSCRIPT}<w:footnoteReference w:id=\"{id}\"/></w:r><w:r>{props}<w:t xml:space=\"preserve\">"));
         self.footnotes.push((id, text));
+    }
+
+    /// The value's text marked with its comments, in the body; elsewhere the text alone.
+    fn print_commented(&mut self, text: &str, comments: Vec<Comment>, run_props: Option<&str>) {
+        let is_body = self.part.is_empty() || self.part == crate::DOCUMENT_PART;
+        let Some(props) = run_props.filter(|_| is_body) else {
+            self.print_text(text, run_props);
+            return;
+        };
+        let first = self.state.next_comment_id;
+        self.state.next_comment_id += comments.len() as u32;
+        let ids = first..self.state.next_comment_id;
+        self.out.push_str("</w:t></w:r>");
+        for id in ids.clone() {
+            self.out.push_str(&format!("<w:commentRangeStart w:id=\"{id}\"/>"));
+        }
+        self.out.push_str("<w:r>");
+        self.out.push_str(props);
+        self.out.push_str("<w:t xml:space=\"preserve\">");
+        self.print_text(text, Some(props));
+        self.out.push_str("</w:t></w:r>");
+        for id in ids.clone() {
+            self.out.push_str(&format!("<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"));
+        }
+        self.out.push_str("<w:r>");
+        self.out.push_str(props);
+        self.out.push_str("<w:t xml:space=\"preserve\">");
+        for (id, comment) in ids.zip(comments) {
+            self.comments.push(Comment { id, ..comment });
+        }
     }
 
     fn print_image(&mut self, value: Option<&Value>, cell_width: Option<f64>, is_centered: bool) {

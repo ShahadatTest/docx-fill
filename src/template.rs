@@ -1,5 +1,7 @@
 //! Parses a part into XML, text and tags, and pairs its loops with the XML they repeat.
 
+use crate::comments::CommentDefaults;
+use crate::sections::SectionTag;
 use crate::styling::StyleKind;
 use crate::table_merge::{Merge, read_merge};
 use crate::xml::{ElementKind, Token, read_attribute, tokenize, unescape};
@@ -68,6 +70,8 @@ pub(crate) enum TagKind {
     /// `{:includesegment name}`, `{:includeinlinesegment name}`, or with `*` a segment named by
     /// the value.
     IncludeSegment { is_inline: bool, is_dynamic: bool },
+    /// `{:subsection name}`, `{:replacesection name}` or `{:page name}`.
+    Section(SectionTag),
 }
 
 /// What a styling tag styles.
@@ -113,6 +117,8 @@ pub(crate) enum BlockKind {
     Segment { name: String },
     /// An `{:includesegment}` tag's paragraph, or an inline one's tag.
     IncludeSegment { name: String, is_dynamic: bool },
+    /// A section tag's paragraph.
+    Section { name: String, tag: SectionTag },
 }
 
 /// A range of parts a loop or raw tag replaces: `start..end` is printed as `body_start..body_end`
@@ -139,6 +145,8 @@ pub struct Template {
     pub(crate) linebreaks: bool,
     pub(crate) html_extras: bool,
     pub(crate) drop_style_paragraphs: bool,
+    /// With comments on, the comment author and date a value gives none of.
+    pub(crate) comment_defaults: Option<CommentDefaults>,
     /// The largest drawing id the part uses, so new drawings take ids after it.
     pub(crate) max_drawing_id: u32,
     /// Page width and height in pixels, less margins, from the part's last section.
@@ -229,7 +237,7 @@ impl Template {
         for tag in &mut tags {
             match &mut tag.kind {
                 TagKind::Image { cell_width, .. } => *cell_width = read_cell_width(&parts, tag.part),
-                TagKind::Value if options.linebreaks => tag.run_props = read_run_props(&parts, tag.part),
+                TagKind::Value if options.linebreaks || options.extensions.comments => tag.run_props = read_run_props(&parts, tag.part),
                 TagKind::Footnote => tag.run_props = read_run_props(&parts, tag.part),
                 _ => {}
             }
@@ -246,6 +254,7 @@ impl Template {
             linebreaks: options.linebreaks,
             html_extras: options.extensions.html_extras,
             drop_style_paragraphs: options.drop_style_paragraphs,
+            comment_defaults: options.extensions.comments.then(|| options.comments.clone()),
         };
         template.nest_blocks()?;
         Ok(template)
@@ -278,7 +287,7 @@ impl Template {
             BlockKind::Loop { name, .. } | BlockKind::Raw { name } => name,
             BlockKind::Placeholder { names } => names.first().map_or("", String::as_str),
             BlockKind::FullTable { name, .. } | BlockKind::Grid { name } => name,
-            BlockKind::Include { name } | BlockKind::Segment { name } | BlockKind::IncludeSegment { name, .. } => name,
+            BlockKind::Include { name } | BlockKind::Segment { name } | BlockKind::IncludeSegment { name, .. } | BlockKind::Section { name, .. } => name,
         }
     }
 }
@@ -425,6 +434,13 @@ fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
 }
 
 fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, String)> {
+    if extensions.sections {
+        for (prefix, tag) in [(":subsection ", SectionTag::Subsection), (":replacesection ", SectionTag::Replace), (":page ", SectionTag::Page)] {
+            if let Some(name) = text.strip_prefix(prefix) {
+                return Some((TagKind::Section(tag), name.trim().to_string()));
+            }
+        }
+    }
     if extensions.subtemplates {
         if matches!(text.trim(), ":segment/" | ":inlinesegment/") {
             return Some((TagKind::Close, String::new()));
@@ -631,6 +647,11 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                 children: Vec::new(),
                 open_tag: index,
             }),
+            TagKind::Section(section) => {
+                let (start, end) = find_enclosing(parts, tag.part, PARAGRAPH).ok_or_else(|| not_inside(tag, PARAGRAPH))?;
+                let kind = BlockKind::Section { name: tag.name.clone(), tag: section };
+                blocks.push(Block { kind, start, end: end + 1, body_start: end + 1, body_end: end + 1, children: Vec::new(), open_tag: index });
+            }
             TagKind::FullTable => {
                 if !tag.is_alone {
                     return Err(FillError::new(format!("The table tag \"{}\" should be the only text in its paragraph", tag.text)));
