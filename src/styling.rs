@@ -1,11 +1,33 @@
-//! `{:stylepar}`, `{:stylerow}` and `{:stylerun}`, and the properties `{:stylecell}` sets beyond its
-//! fill. Built from the WordprocessingML spec and the styling tags' documented values.
+//! `{:stylepar}`, `{:stylerow}`, `{:stylerun}`, `{:stylebullets}`, `{:styleshape}`,
+//! `{:stylestart}` … `{:/style}`, `{::stylepar}` and `{::stylerun}`, and the properties
+//! `{:stylecell}` sets beyond its fill. Built from the WordprocessingML and DrawingML specs and the
+//! styling tags' documented values.
 
 use serde_json::Value;
 
 use crate::cell_styling::{read_fill, shade_cell};
-use crate::properties::{CELL_ORDER, PARAGRAPH_ORDER, RUN_ORDER, edit_each, edit_properties, set_child};
+use crate::properties::{CELL_ORDER, PARAGRAPH_ORDER, RUN_ORDER, edit_each, edit_properties, read_child, set_attribute, set_child};
 use crate::xml::escape;
+
+// Mark a `{:stylestart}` range's start (with its index) and end in the filled XML.
+pub(crate) const RANGE_START: char = '\u{E002}';
+pub(crate) const RANGE_START_END: char = '\u{E003}';
+pub(crate) const RANGE_END: char = '\u{E004}';
+
+/// `<wps:spPr>` children in schema order.
+const SHAPE_ORDER: &[&str] = &[
+    "a:xfrm", "a:custGeom", "a:prstGeom", "a:noFill", "a:solidFill", "a:gradFill", "a:blipFill", "a:pattFill", "a:grpFill", "a:ln", "a:effectLst",
+    "a:effectDag", "a:scene3d", "a:sp3d", "a:extLst",
+];
+/// `<a:ln>` children in schema order.
+const LINE_ORDER: &[&str] = &["a:noFill", "a:solidFill", "a:gradFill", "a:pattFill", "a:prstDash", "a:custDash", "a:round", "a:bevel", "a:miter", "a:headEnd", "a:tailEnd", "a:extLst"];
+const FILLS: &[&str] = &["a:noFill", "a:solidFill", "a:gradFill", "a:blipFill", "a:pattFill", "a:grpFill"];
+/// `<w:style>` children in schema order.
+const STYLE_ORDER: &[&str] = &[
+    "w:name", "w:aliases", "w:basedOn", "w:next", "w:link", "w:autoRedefine", "w:hidden", "w:uiPriority", "w:semiHidden", "w:unhideWhenUsed",
+    "w:qFormat", "w:locked", "w:personal", "w:personalCompose", "w:personalReply", "w:rsid", "w:pPr", "w:rPr", "w:tblPr", "w:trPr", "w:tcPr",
+    "w:tblStylePr",
+];
 
 // Border sides each container takes, in schema order.
 const PARAGRAPH_SIDES: &[&str] = &["top", "left", "bottom", "right", "between", "bar"];
@@ -28,15 +50,38 @@ pub(crate) struct Style {
     pub underline: Option<bool>,
     /// Side and its `w:val`, `w:sz`, `w:space` and `w:color` attributes.
     pub borders: Vec<(String, String)>,
+    /// A list paragraph's bullet or number, which takes the paragraph mark's colour.
+    pub bullet_color: Option<String>,
+    pub shape_fill: Option<String>,
+    pub shape_stroke: Option<String>,
 }
 
 impl Style {
+    /// This style with `over`'s settings on top.
+    pub(crate) fn and(self, over: Style) -> Style {
+        Style {
+            fill: over.fill.or(self.fill),
+            text_color: over.text_color.or(self.text_color),
+            align: over.align.or(self.align),
+            paragraph_style: over.paragraph_style.or(self.paragraph_style),
+            font_size: over.font_size.or(self.font_size),
+            font_family: over.font_family.or(self.font_family),
+            bold: over.bold.or(self.bold),
+            italic: over.italic.or(self.italic),
+            underline: over.underline.or(self.underline),
+            borders: if over.borders.is_empty() { self.borders } else { over.borders },
+            bullet_color: over.bullet_color.or(self.bullet_color),
+            shape_fill: over.shape_fill.or(self.shape_fill),
+            shape_stroke: over.shape_stroke.or(self.shape_stroke),
+        }
+    }
+
     fn has_run_properties(&self) -> bool {
         self.text_color.is_some() || self.font_size.is_some() || self.font_family.is_some() || self.bold.is_some() || self.italic.is_some() || self.underline.is_some()
     }
 
     fn has_paragraph_properties(&self) -> bool {
-        self.align.is_some() || self.paragraph_style.is_some() || self.has_run_properties()
+        self.align.is_some() || self.paragraph_style.is_some() || self.bullet_color.is_some() || self.has_run_properties()
     }
 }
 
@@ -44,7 +89,8 @@ impl Style {
 ///
 /// Keys: `cellBackground`, `textColor` (hex), `textAlign` (`left`, `center`, `right`, `justify`),
 /// `pStyle`, `fontSize` (half-points), `fontFamily`, `bold`, `italic`, `underline` and
-/// `borders` (`{ "top": { "val", "sz", "space", "color" } }`).
+/// `borders` (`{ "top": { "val", "sz", "space", "color" } }`), and for bullets `bulletColor`, for
+/// shapes `fillColor` and `strokeColor`.
 pub(crate) fn read_style(value: Option<&Value>) -> Option<Style> {
     let value = value.filter(|value| value.is_object())?;
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
@@ -63,6 +109,9 @@ pub(crate) fn read_style(value: Option<&Value>) -> Option<Style> {
         italic: flag("italic"),
         underline: flag("underline"),
         borders,
+        bullet_color: text("bulletColor").and_then(read_hex),
+        shape_fill: text("fillColor").and_then(read_hex),
+        shape_stroke: text("strokeColor").and_then(read_hex),
     })
 }
 
@@ -178,10 +227,13 @@ pub(crate) fn style_paragraph(paragraph: &str, style: &Style, is_own: bool) -> S
         if let Some(align) = style.align {
             inner = set_child(&inner, "w:jc", &format!("<w:jc w:val=\"{align}\"/>"), PARAGRAPH_ORDER);
         }
-        if style.has_run_properties() {
-            let mark = crate::properties::read_child(&inner, "w:rPr").unwrap_or_default();
-            let mark = format!("<w:rPr>{}</w:rPr>", style_run_properties(mark, style));
-            inner = set_child(&inner, "w:rPr", &mark, PARAGRAPH_ORDER);
+        if style.has_run_properties() || style.bullet_color.is_some() {
+            let mark = read_child(&inner, "w:rPr").unwrap_or_default();
+            let mut mark = style_run_properties(mark, style);
+            if let Some(color) = &style.bullet_color {
+                mark = set_child(&mark, "w:color", &format!("<w:color w:val=\"{color}\"/>"), RUN_ORDER);
+            }
+            inner = set_child(&inner, "w:rPr", &format!("<w:rPr>{mark}</w:rPr>"), PARAGRAPH_ORDER);
         }
         inner
     });
@@ -207,4 +259,180 @@ pub(crate) fn style_cell(cell: &str, style: &Style) -> String {
 /// `row`, a whole `<w:tr>`, with every cell styled.
 pub(crate) fn style_row(row: &str, style: &Style) -> String {
     edit_each(row, "w:tc", |cell| style_cell(cell, style))
+}
+
+/// `shape`, a whole `<wps:wsp>` or VML shape, with the style's fill and outline colours.
+pub(crate) fn style_shape(shape: &str, style: &Style) -> String {
+    if style.shape_fill.is_none() && style.shape_stroke.is_none() {
+        return shape.to_string();
+    }
+    if !shape.starts_with("<wps:") {
+        let Some(open_end) = shape.find('>').map(|at| at + 1) else { return shape.to_string() };
+        let mut open = shape[..open_end].to_string();
+        if let Some(fill) = &style.shape_fill {
+            open = set_attribute(&open, "fillcolor", &format!("#{fill}"));
+            open = set_attribute(&open, "filled", "t");
+        }
+        if let Some(stroke) = &style.shape_stroke {
+            open = set_attribute(&open, "strokecolor", &format!("#{stroke}"));
+            open = set_attribute(&open, "stroked", "t");
+        }
+        return format!("{open}{}", &shape[open_end..]);
+    }
+    edit_each(shape, "wps:spPr", |properties| {
+        let properties = if let Some(open) = properties.strip_suffix("/>") { format!("{open}></wps:spPr>") } else { properties.to_string() };
+        let open_end = properties.find('>').map_or(0, |at| at + 1);
+        let close = properties.len() - "</wps:spPr>".len();
+        let mut inner = properties[open_end..close].to_string();
+        if let Some(fill) = &style.shape_fill {
+            for other in FILLS {
+                inner = set_child(&inner, other, "", SHAPE_ORDER);
+            }
+            inner = set_child(&inner, "a:solidFill", &solid_fill(fill), SHAPE_ORDER);
+        }
+        if let Some(stroke) = &style.shape_stroke {
+            inner = match read_child(&inner, "a:ln") {
+                Some(_) => edit_each(&inner, "a:ln", |line| set_line_fill(line, stroke)),
+                None => set_child(&inner, "a:ln", &format!("<a:ln>{}</a:ln>", solid_fill(stroke)), SHAPE_ORDER),
+            };
+        }
+        format!("{}{inner}</wps:spPr>", &properties[..open_end])
+    })
+}
+
+fn solid_fill(color: &str) -> String {
+    format!("<a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill>")
+}
+
+fn set_line_fill(line: &str, color: &str) -> String {
+    let line = if let Some(open) = line.strip_suffix("/>") { format!("{open}></a:ln>") } else { line.to_string() };
+    let open_end = line.find('>').map_or(0, |at| at + 1);
+    let close = line.len() - "</a:ln>".len();
+    let mut inner = line[open_end..close].to_string();
+    for other in FILLS {
+        inner = set_child(&inner, other, "", LINE_ORDER);
+    }
+    inner = set_child(&inner, "a:solidFill", &solid_fill(color), LINE_ORDER);
+    format!("{}{inner}</a:ln>", &line[..open_end])
+}
+
+/// `xml` with each run between a `{:stylestart}` mark and its `{:/style}` mark styled by the
+/// ranges open around it. A run holding a mark is split there, and the marks go.
+pub(crate) fn style_ranges(xml: &str, styles: &[Style]) -> String {
+    let mut open: Vec<usize> = Vec::new();
+    edit_each(xml, "w:r", |run| {
+        let current = |open: &[usize]| open.iter().fold(None::<Style>, |style, index| Some(style.unwrap_or_default().and(styles[*index].clone())));
+        if !run.contains([RANGE_START, RANGE_END]) {
+            return match current(&open) {
+                Some(style) => style_run(run, &style),
+                None => run.to_string(),
+            };
+        }
+
+        // The run's start tag and properties, repeated on each piece.
+        let open_end = run.find('>').map_or(0, |at| at + 1);
+        let rest = &run[open_end..run.len() - "</w:r>".len()];
+        let (props, content) = match rest.strip_prefix("<w:rPr/>") {
+            Some(content) => ("", content),
+            None if rest.starts_with("<w:rPr>") => match rest.find("</w:rPr>") {
+                Some(end) => rest.split_at(end + "</w:rPr>".len()),
+                None => ("", rest),
+            },
+            None => ("", rest),
+        };
+        let start = &run[..open_end];
+        let mut out = String::new();
+        let mut piece = String::new();
+        let write = |out: &mut String, piece: &str, style: Option<Style>| {
+            let bare = piece.replace("<w:t xml:space=\"preserve\"></w:t>", "").replace("<w:t></w:t>", "");
+            if bare.is_empty() {
+                return;
+            }
+            let written = format!("{start}{props}{piece}</w:r>");
+            out.push_str(&match style {
+                Some(style) => style_run(&written, &style),
+                None => written,
+            });
+        };
+        let mut chars = content.char_indices().peekable();
+        while let Some((_, c)) = chars.next() {
+            if c != RANGE_START && c != RANGE_END {
+                piece.push(c);
+                continue;
+            }
+            piece.push_str("</w:t>");
+            write(&mut out, &piece, current(&open));
+            piece = "<w:t xml:space=\"preserve\">".to_string();
+            if c == RANGE_END {
+                open.pop();
+                continue;
+            }
+            let mut index = String::new();
+            for (_, digit) in chars.by_ref() {
+                if digit == RANGE_START_END {
+                    break;
+                }
+                index.push(digit);
+            }
+            if let Ok(index) = index.parse::<usize>().map(|index| index.min(styles.len().saturating_sub(1))) {
+                open.push(index);
+            }
+        }
+        write(&mut out, &piece, current(&open));
+        out
+    })
+}
+
+/// Which style definitions a global styling tag changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StyleKind {
+    Paragraph,
+    Character,
+}
+
+impl StyleKind {
+    fn name(self) -> &'static str {
+        match self {
+            StyleKind::Paragraph => "paragraph",
+            StyleKind::Character => "character",
+        }
+    }
+}
+
+/// `styles`, a styles part, with the definition of style `id` (the default style of `kind` for
+/// `None`) given the style's properties.
+pub(crate) fn style_definition(styles: &str, kind: StyleKind, id: Option<&str>, style: &Style) -> String {
+    edit_each(styles, "w:style", |definition| {
+        let open_end = definition.find('>').map_or(0, |at| at + 1);
+        let open = &definition[..open_end];
+        if crate::xml::read_attribute(open, "w:type") != Some(kind.name()) {
+            return definition.to_string();
+        }
+        let is_match = match id {
+            Some(id) => crate::xml::read_attribute(open, "w:styleId") == Some(id),
+            None => matches!(crate::xml::read_attribute(open, "w:default"), Some("1" | "true" | "on")),
+        };
+        if !is_match || open.ends_with("/>") {
+            return definition.to_string();
+        }
+        let mut inner = definition[open_end..definition.len() - "</w:style>".len()].to_string();
+        if kind == StyleKind::Paragraph && (style.align.is_some() || style.fill.is_some() || !style.borders.is_empty()) {
+            let mut properties = read_child(&inner, "w:pPr").unwrap_or_default().to_string();
+            if !style.borders.is_empty() {
+                properties = set_child(&properties, "w:pBdr", &write_borders("w:pBdr", PARAGRAPH_SIDES, &style.borders), PARAGRAPH_ORDER);
+            }
+            if let Some(fill) = &style.fill {
+                properties = set_child(&properties, "w:shd", &format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>"), PARAGRAPH_ORDER);
+            }
+            if let Some(align) = style.align {
+                properties = set_child(&properties, "w:jc", &format!("<w:jc w:val=\"{align}\"/>"), PARAGRAPH_ORDER);
+            }
+            inner = set_child(&inner, "w:pPr", &format!("<w:pPr>{properties}</w:pPr>"), STYLE_ORDER);
+        }
+        if style.has_run_properties() {
+            let properties = style_run_properties(read_child(&inner, "w:rPr").unwrap_or_default(), style);
+            inner = set_child(&inner, "w:rPr", &format!("<w:rPr>{properties}</w:rPr>"), STYLE_ORDER);
+        }
+        format!("{open}{inner}</w:style>")
+    })
 }

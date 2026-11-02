@@ -43,6 +43,7 @@ use images::MediaUse;
 use render::FillState;
 
 pub(crate) const DOCUMENT_PART: &str = "word/document.xml";
+const STYLES_PART: &str = "word/styles.xml";
 pub(crate) const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const IMAGE_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const HYPERLINK_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
@@ -147,6 +148,8 @@ pub struct FillOptions {
     pub module_prefixes: Vec<String>,
     /// Edits to the whole package, applied when filling one.
     pub document: DocumentEdits,
+    /// Drops the paragraphs holding `{::stylepar}` tags.
+    pub drop_style_paragraphs: bool,
 }
 
 impl Default for FillOptions {
@@ -161,6 +164,7 @@ impl Default for FillOptions {
             drop_empty_last_page: true,
             module_prefixes: Vec::new(),
             document: DocumentEdits::default(),
+            drop_style_paragraphs: false,
         }
     }
 }
@@ -286,6 +290,7 @@ impl PackageTemplate {
         let mut media: Vec<(String, MediaUse)> = Vec::new();
         let mut notes = Vec::new();
         let mut links: Vec<(String, Vec<String>)> = Vec::new();
+        let mut definitions = Vec::new();
         for (name, part) in &self.parts {
             let bytes = match part {
                 PackagePart::Bytes(bytes) => Cow::Borrowed(bytes.as_slice()),
@@ -295,6 +300,7 @@ impl PackageTemplate {
                     if name == DOCUMENT_PART {
                         notes = filled.footnotes;
                     }
+                    definitions.extend(filled.style_definitions);
                     if !filled.links.is_empty() {
                         links.push((name.clone(), filled.links));
                     }
@@ -306,6 +312,7 @@ impl PackageTemplate {
         }
         add_media(&mut out, &media);
         add_links(&mut out, &links);
+        restyle_definitions(&mut out, &definitions);
         footnotes::add_footnotes(&mut out, &notes);
         self.document.apply(&mut out);
         out
@@ -333,6 +340,19 @@ fn add_media(parts: &mut Vec<(String, Cow<[u8]>)>, media: &[(String, MediaUse)])
             types.1 = Cow::Owned(insert_before_last(&xml, "</Types>", &default).into_bytes());
         }
     }
+}
+
+/// Applies `{::stylepar}` and `{::stylerun}` changes to the styles part.
+fn restyle_definitions(parts: &mut [(String, Cow<[u8]>)], definitions: &[(styling::StyleKind, Option<String>, styling::Style)]) {
+    if definitions.is_empty() {
+        return;
+    }
+    let Some(styles) = parts.iter_mut().find(|(name, _)| name == STYLES_PART) else { return };
+    let mut xml = String::from_utf8_lossy(&styles.1).into_owned();
+    for (kind, id, style) in definitions {
+        xml = styling::style_definition(&xml, *kind, id.as_deref(), style);
+    }
+    styles.1 = Cow::Owned(xml.into_bytes());
 }
 
 /// Each part's external links, as relationships its hyperlinks name.

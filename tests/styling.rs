@@ -70,3 +70,75 @@ fn ignores_a_style_that_is_not_an_object() {
         assert_eq!(fill(template, json!({ "s": value })), r#"<w:p><w:r><w:t xml:space="preserve">x</w:t></w:r></w:p>"#);
     }
 }
+
+#[test]
+fn colours_the_bullet_of_the_tags_paragraph() {
+    let body = fill(
+        r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{:stylebullets s}item</w:t></w:r></w:p>"#,
+        json!({ "s": { "bulletColor": "#ff0000" } }),
+    );
+
+    assert!(body.contains(r#"<w:rPr><w:color w:val="FF0000"/></w:rPr></w:pPr>"#));
+    assert!(!body.contains(r#"<w:r><w:rPr>"#));
+}
+
+#[test]
+fn colours_a_drawingml_shape() {
+    let body = fill(
+        r#"<w:p><w:r><w:drawing><wps:wsp><wps:spPr><a:prstGeom prst="rect"/><a:noFill/><a:ln w="9525"><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>{:styleshape s}box</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></w:drawing></w:r></w:p>"#,
+        json!({ "s": { "fillColor": "#00ff00", "strokeColor": "#0000ff" } }),
+    );
+
+    assert!(body.contains(
+        r#"<wps:spPr><a:prstGeom prst="rect"/><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln></wps:spPr>"#
+    ));
+}
+
+#[test]
+fn colours_a_vml_shape() {
+    let body = fill(
+        r#"<w:p><w:r><w:pict><v:rect fillcolor="white"><v:textbox><w:txbxContent><w:p><w:r><w:t>{:styleshape s}box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:rect></w:pict></w:r></w:p>"#,
+        json!({ "s": { "fillColor": "#00ff00", "strokeColor": "#0000ff" } }),
+    );
+
+    assert!(body.contains(r##"<v:rect fillcolor="#00FF00" filled="t" strokecolor="#0000FF" stroked="t">"##));
+}
+
+#[test]
+fn styles_the_runs_between_start_and_end_tags() {
+    let body = fill(
+        r#"<w:p><w:r><w:t>a{:stylestart s}b</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>c{:/style}d</w:t></w:r></w:p>"#,
+        json!({ "s": { "bold": true } }),
+    );
+
+    let runs = elements(&body, "w:r");
+    assert_eq!(runs.len(), 4);
+    assert!(!runs[0].contains("<w:b/>") && runs[0].contains(">a<"));
+    assert!(runs[1].contains("<w:b/>") && runs[1].contains(">b<"));
+    assert!(runs[2].contains("<w:b/>") && runs[2].contains("<w:i/>") && runs[2].contains(">c<"));
+    assert!(!runs[3].contains("<w:b/>") && runs[3].contains(">d<"));
+    assert!(!body.contains(['\u{E002}', '\u{E003}', '\u{E004}']));
+}
+
+#[test]
+fn nests_ranges_across_paragraphs() {
+    let body = fill(
+        r#"<w:p><w:r><w:t>{:stylestart outer}a{:stylestart inner}b</w:t></w:r></w:p><w:p><w:r><w:t>c{:/style}d{:/style}e</w:t></w:r></w:p>"#,
+        json!({ "outer": { "italic": true }, "inner": { "bold": true } }),
+    );
+
+    let runs = elements(&body, "w:r");
+    let styled = |text: &str| runs.iter().find(|run| run.contains(&format!(">{text}<"))).unwrap().to_string();
+    assert!(styled("a").contains("<w:i/>") && !styled("a").contains("<w:b/>"));
+    assert!(styled("b").contains("<w:i/>") && styled("b").contains("<w:b/>"));
+    assert!(styled("c").contains("<w:i/>") && styled("c").contains("<w:b/>"));
+    assert!(styled("d").contains("<w:i/>") && !styled("d").contains("<w:b/>"));
+    assert!(!styled("e").contains("<w:i/>"));
+}
+
+#[test]
+fn combines_two_styles_on_one_paragraph() {
+    let body = fill(r#"<w:p><w:r><w:t>{:stylepar a}{:stylepar b}x</w:t></w:r></w:p>"#, json!({ "a": { "bold": true, "textColor": "#111111" }, "b": { "textColor": "#222222" } }));
+
+    assert!(body.contains(r#"<w:b/><w:bCs/><w:color w:val="222222"/>"#));
+}

@@ -1,5 +1,6 @@
 //! Parses a part into XML, text and tags, and pairs its loops with the XML they repeat.
 
+use crate::styling::StyleKind;
 use crate::table_merge::{Merge, read_merge};
 use crate::xml::{ElementKind, Token, read_attribute, tokenize, unescape};
 use crate::{Delimiters, Extensions, FillError, FillOptions};
@@ -40,8 +41,14 @@ pub(crate) enum TagKind {
     /// `{%name}` or `{%%name}`: an image filling its table cell, else the page's width. With
     /// centred images on, `{%%name}` centres its paragraph.
     Image { cell_width: Option<f64>, is_centered: bool },
-    /// `{:stylepar name}`, `{:stylerow name}` or `{:stylerun name}`.
+    /// `{:stylepar name}`, `{:stylerow name}`, `{:stylerun name}`, `{:stylebullets name}`,
+    /// `{:styleshape name}` or `{:stylestart name}`.
     Style(StyleTarget),
+    /// `{:/style}`: ends the innermost `{:stylestart}` range.
+    StyleEnd,
+    /// `{::stylepar name}` or `{::stylerun name}`: restyles the definition of the tag
+    /// paragraph's or run's style.
+    GlobalStyle(StyleKind),
     /// `{:merge-cells-col 1,2}` or `{:merge-cells-row}`: merges equal cells of the tag's table.
     TableMerge(Merge),
     /// `{r@name}`: replaces its run with the value as raw XML.
@@ -59,9 +66,13 @@ pub(crate) enum TagKind {
 /// What a styling tag styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StyleTarget {
+    /// `{:stylepar}` and `{:stylebullets}`.
     Paragraph,
     Row,
     Run,
+    Shape,
+    /// `{:stylestart}`: the runs up to `{:/style}`.
+    Range,
 }
 
 #[derive(Debug)]
@@ -114,6 +125,7 @@ pub struct Template {
     pub(crate) top: Vec<usize>,
     pub(crate) linebreaks: bool,
     pub(crate) html_extras: bool,
+    pub(crate) drop_style_paragraphs: bool,
     /// The largest drawing id the part uses, so new drawings take ids after it.
     pub(crate) max_drawing_id: u32,
     /// Page width and height in pixels, less margins, from the part's last section.
@@ -220,6 +232,7 @@ impl Template {
             top: Vec::new(),
             linebreaks: options.linebreaks,
             html_extras: options.extensions.html_extras,
+            drop_style_paragraphs: options.drop_style_paragraphs,
         };
         template.nest_blocks()?;
         Ok(template)
@@ -418,7 +431,23 @@ fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, S
         }
     }
     if extensions.styling {
-        for (prefix, target) in [(":stylepar ", StyleTarget::Paragraph), (":stylerow ", StyleTarget::Row), (":stylerun ", StyleTarget::Run)] {
+        for (prefix, kind) in [("::stylepar ", StyleKind::Paragraph), ("::stylerun ", StyleKind::Character)] {
+            if let Some(name) = text.strip_prefix(prefix) {
+                return Some((TagKind::GlobalStyle(kind), name.trim().to_string()));
+            }
+        }
+        if text.trim() == ":/style" {
+            return Some((TagKind::StyleEnd, String::new()));
+        }
+        let targets = [
+            (":stylepar ", StyleTarget::Paragraph),
+            (":stylebullets ", StyleTarget::Paragraph),
+            (":stylerow ", StyleTarget::Row),
+            (":stylerun ", StyleTarget::Run),
+            (":styleshape ", StyleTarget::Shape),
+            (":stylestart ", StyleTarget::Range),
+        ];
+        for (prefix, target) in targets {
             if let Some(name) = text.strip_prefix(prefix) {
                 return Some((TagKind::Style(target), name.trim().to_string()));
             }
@@ -583,6 +612,8 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
             | TagKind::RichText { .. }
             | TagKind::Image { .. }
             | TagKind::Style(_)
+            | TagKind::StyleEnd
+            | TagKind::GlobalStyle(_)
             | TagKind::TableMerge(_)
             | TagKind::Footnote => {}
         }

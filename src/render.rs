@@ -3,13 +3,14 @@
 use serde_json::Value;
 
 use crate::properties::edit_each;
-use crate::styling::{Style, read_style, style_cell, style_paragraph, style_row, style_run};
+use crate::styling::{RANGE_END, RANGE_START, RANGE_START_END, Style, StyleKind, read_style, style_cell, style_paragraph, style_ranges, style_row, style_run, style_shape};
 use crate::table_merge::{Merge, merge_table};
 use crate::full_table::{Grid, write_table};
 use crate::images::{Image, MediaUse, body_or_default, drawing_size, drawing_xml};
 use crate::rich_text::{self, RichValue};
 use crate::template::{BlockKind, Part, StyleTarget, TagKind, Template};
-use crate::xml::{ElementKind, escape};
+use crate::cell_styling;
+use crate::xml::{ElementKind, escape, read_attribute};
 
 // A `\n` in a value outside a run: the text continues after a line break.
 const LINE_BREAK: &str = "</w:t><w:br/><w:t xml:space=\"preserve\">";
@@ -18,6 +19,8 @@ const CELL: &str = "w:tc";
 const ROW: &str = "w:tr";
 const TABLE: &str = "w:tbl";
 const RUN: &str = "w:r";
+// Shapes `{:styleshape}` colours: DrawingML and the VML Word writes as a fallback.
+const SHAPES: [&str; 5] = ["wps:wsp", "v:shape", "v:rect", "v:roundrect", "v:oval"];
 const SUPERSCRIPT: &str = "<w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>";
 
 /// A tag a module claims, by its prefix in `FillOptions::module_prefixes`.
@@ -66,6 +69,17 @@ pub(crate) struct FilledPart {
     pub footnotes: Vec<(u32, String)>,
     /// External link addresses, by relationship index.
     pub links: Vec<String>,
+    /// Style definitions to change: their kind, id (`None` for the default) and style.
+    pub style_definitions: Vec<(StyleKind, Option<String>, Style)>,
+}
+
+/// A paragraph open in the output.
+struct ParagraphFrame {
+    start: usize,
+    has_rich_text: bool,
+    style: Option<Style>,
+    /// Held a `{::stylepar}` tag, with such paragraphs dropped.
+    is_dropped: bool,
 }
 
 struct Render<'a, 'h> {
@@ -74,14 +88,16 @@ struct Render<'a, 'h> {
     hooks: &'h mut dyn FillHooks,
     state: &'h mut FillState,
     out: String,
-    /// Output offsets of the paragraphs open now, whether each holds rich text marks, and its
-    /// style.
-    paragraphs: Vec<(usize, bool, Option<Style>)>,
+    paragraphs: Vec<ParagraphFrame>,
     /// Output offsets of the elements open now, with the style or merges each was given.
     cells: Vec<(usize, Option<Style>)>,
     rows: Vec<(usize, Option<Style>)>,
     runs: Vec<(usize, Option<Style>)>,
     tables: Vec<(usize, Vec<Merge>)>,
+    shapes: Vec<(usize, Option<Style>)>,
+    /// `{:stylestart}` ranges' styles, by the index their marks carry.
+    ranges: Vec<Style>,
+    style_definitions: Vec<(StyleKind, Option<String>, Style)>,
     rich_values: Vec<RichValue>,
     media: Vec<MediaUse>,
     footnotes: Vec<(u32, String)>,
@@ -113,6 +129,9 @@ impl Template {
             rows: Vec::new(),
             runs: Vec::new(),
             tables: Vec::new(),
+            shapes: Vec::new(),
+            ranges: Vec::new(),
+            style_definitions: Vec::new(),
             rich_values: Vec::new(),
             media: Vec::new(),
             footnotes: Vec::new(),
@@ -120,7 +139,8 @@ impl Template {
         };
         let mut scopes = vec![data];
         render.render_range(0, self.parts.len(), &self.top, &mut scopes);
-        FilledPart { xml: render.out, media: render.media, footnotes: render.footnotes, links: render.links }
+        let xml = if render.ranges.is_empty() { render.out } else { style_ranges(&render.out, &render.ranges) };
+        FilledPart { xml, media: render.media, footnotes: render.footnotes, links: render.links, style_definitions: render.style_definitions }
     }
 }
 
@@ -253,16 +273,30 @@ impl<'a> Render<'a, '_> {
                                 cell.1 = Some(style);
                             }
                         }
-                        TagKind::Style(target) => {
-                            let frame = match target {
-                                StyleTarget::Paragraph => self.paragraphs.last_mut().map(|frame| &mut frame.2),
-                                StyleTarget::Row => self.rows.last_mut().map(|frame| &mut frame.1),
-                                StyleTarget::Run => self.runs.last_mut().map(|frame| &mut frame.1),
-                            };
-                            if let (Some(style), Some(frame)) = (read_style(value()), frame) {
-                                *frame = Some(style);
+                        TagKind::Style(StyleTarget::Range) => {
+                            self.out.push(RANGE_START);
+                            self.out.push_str(&self.ranges.len().to_string());
+                            self.out.push(RANGE_START_END);
+                            self.ranges.push(read_style(value()).unwrap_or_default());
+                        }
+                        TagKind::StyleEnd => {
+                            if !self.ranges.is_empty() {
+                                self.out.push(RANGE_END);
                             }
                         }
+                        TagKind::Style(target) => {
+                            let frame = match target {
+                                StyleTarget::Paragraph => self.paragraphs.last_mut().map(|frame| &mut frame.style),
+                                StyleTarget::Row => self.rows.last_mut().map(|frame| &mut frame.1),
+                                StyleTarget::Run => self.runs.last_mut().map(|frame| &mut frame.1),
+                                StyleTarget::Shape => self.shapes.last_mut().map(|frame| &mut frame.1),
+                                StyleTarget::Range => None,
+                            };
+                            if let (Some(style), Some(frame)) = (read_style(value()), frame) {
+                                *frame = Some(frame.take().unwrap_or_default().and(style));
+                            }
+                        }
+                        TagKind::GlobalStyle(kind) => self.restyle_definition(kind, read_style(value())),
                         TagKind::TableMerge(ref merge) => {
                             if let Some(table) = self.tables.last_mut() {
                                 table.1.push(merge.clone());
@@ -285,7 +319,7 @@ impl<'a> Render<'a, '_> {
                             self.out.push_str(&rich_text::mark(self.rich_values.len()));
                             self.rich_values.push(RichValue { html, is_block, has_extras: self.template.html_extras });
                             if let Some(paragraph) = self.paragraphs.last_mut() {
-                                paragraph.1 = true;
+                                paragraph.has_rich_text = true;
                             }
                         }
                         TagKind::Image { cell_width, is_centered } => self.print_image(value(), cell_width, is_centered),
@@ -302,13 +336,18 @@ impl<'a> Render<'a, '_> {
         let start = self.out.len();
         self.out.push_str(raw);
         match (kind, name) {
-            (ElementKind::Open, PARAGRAPH) => self.paragraphs.push((start, false, None)),
+            (ElementKind::Open, PARAGRAPH) => self.paragraphs.push(ParagraphFrame { start, has_rich_text: false, style: None, is_dropped: false }),
+            (ElementKind::Open, shape) if SHAPES.contains(&shape) => self.shapes.push((start, None)),
             (ElementKind::Open, CELL) => self.cells.push((start, None)),
             (ElementKind::Open, ROW) => self.rows.push((start, None)),
             (ElementKind::Open, RUN) => self.runs.push((start, None)),
             (ElementKind::Open, TABLE) => self.tables.push((start, Vec::new())),
             (ElementKind::Close, PARAGRAPH) => {
-                let Some((opened, has_rich_text, style)) = self.paragraphs.pop() else { return };
+                let Some(ParagraphFrame { start: opened, has_rich_text, style, is_dropped }) = self.paragraphs.pop() else { return };
+                if is_dropped {
+                    self.out.truncate(opened);
+                    return;
+                }
                 if !has_rich_text && style.is_none() {
                     return;
                 }
@@ -330,6 +369,10 @@ impl<'a> Render<'a, '_> {
                 let frame = self.runs.pop();
                 self.restyle(frame, style_run);
             }
+            (ElementKind::Close, shape) if SHAPES.contains(&shape) => {
+                let frame = self.shapes.pop();
+                self.restyle(frame, style_shape);
+            }
             (ElementKind::Close, TABLE) => {
                 if let Some((opened, merges)) = self.tables.pop().filter(|(_, merges)| !merges.is_empty()) {
                     let merged = merge_table(&self.out[opened..], &merges);
@@ -337,6 +380,27 @@ impl<'a> Render<'a, '_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Records a change to the definition of the open paragraph's or run's style, read from its
+    /// `<w:pStyle>` or `<w:rStyle>`; without one, the default style's.
+    fn restyle_definition(&mut self, kind: StyleKind, style: Option<Style>) {
+        let Some(style) = style else { return };
+        let (start, properties, name) = match kind {
+            StyleKind::Paragraph => (self.paragraphs.last().map(|frame| frame.start), "</w:pPr>", "w:pStyle"),
+            StyleKind::Character => (self.runs.last().map(|frame| frame.0), "</w:rPr>", "w:rStyle"),
+        };
+        let Some(start) = start else { return };
+        let written = &self.out[start..];
+        let properties = written.find(properties).map_or("", |end| &written[..end]);
+        let id = cell_styling::find_element_start(properties, &format!("<{name}")).and_then(|at| {
+            let raw = &properties[at..at + properties[at..].find('>')? + 1];
+            read_attribute(raw, "w:val").map(str::to_string)
+        });
+        self.style_definitions.push((kind, id, style));
+        if let (StyleKind::Paragraph, true, Some(frame)) = (kind, self.template.drop_style_paragraphs, self.paragraphs.last_mut()) {
+            frame.is_dropped = true;
         }
     }
 
@@ -367,7 +431,7 @@ impl<'a> Render<'a, '_> {
         let Some(value) = value.filter(|value| is_truthy(value)) else { return };
         let Some(image) = self.hooks.image(self.part, value) else { return };
         if let (true, Some(paragraph)) = (is_centered, self.paragraphs.last_mut()) {
-            paragraph.2.get_or_insert_with(Style::default).align = Some("center");
+            paragraph.style.get_or_insert_with(Style::default).align = Some("center");
         }
 
         let (body_width, body_height) = body_or_default(self.template.body.or(self.state.body));
