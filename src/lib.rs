@@ -19,6 +19,7 @@ mod empty_last_page;
 mod footnotes;
 mod full_table;
 mod images;
+mod includes;
 mod properties;
 mod render;
 mod rich_text;
@@ -28,7 +29,7 @@ mod template;
 mod xml;
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::Value;
@@ -36,6 +37,7 @@ use serde_json::Value;
 pub use document_edits::{DocumentEdits, Margins};
 pub use empty_last_page::drop_empty_last_page;
 pub use images::Image;
+pub use includes::{IncludeMode, IncludeStyles, Subtemplate};
 pub use render::{FillHooks, ModuleTag, NoHooks};
 pub use template::Template;
 
@@ -43,7 +45,7 @@ use images::MediaUse;
 use render::FillState;
 
 pub(crate) const DOCUMENT_PART: &str = "word/document.xml";
-const STYLES_PART: &str = "word/styles.xml";
+pub(crate) const STYLES_PART: &str = "word/styles.xml";
 pub(crate) const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const IMAGE_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const HYPERLINK_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
@@ -78,8 +80,10 @@ pub struct Extensions {
     /// `{:merge-cells-col 1,2}`, `{:merge-cells-col rtl 1,2}` and `{:merge-cells-row 1,-1}`: merges
     /// neighbouring cells of the tag's table that print the same, non-empty text.
     pub table_merge: bool,
-    /// `{:stylepar name}`, `{:stylerow name}` and `{:stylerun name}`: a style value (see
-    /// [`FillOptions`]) on the tag's paragraph, row or run.
+    /// `{:stylepar name}`, `{:stylerow name}`, `{:stylerun name}`, `{:stylebullets name}` and
+    /// `{:styleshape name}`: a style value on the tag's paragraph, row, run, list bullet or
+    /// shape. `{:stylestart name}` … `{:/style}` styles the runs between. `{::stylepar name}` and
+    /// `{::stylerun name}` restyle the definition of the tag paragraph's or run's style.
     pub styling: bool,
     /// `{r@name}`: replaces the tag's run with the value as raw `<w:r>` XML.
     pub word_run: bool,
@@ -97,6 +101,12 @@ pub struct Extensions {
     pub html_extras: bool,
     /// `{%%name}`, alone in its paragraph, centres the paragraph. Off, it draws as `{%name}` does.
     pub centered_images: bool,
+    /// `{:include name}` prints the bodies of the subtemplates the value names (see
+    /// [`PackageTemplate::add_include`]) in place of its paragraph. `{:segment name}` …
+    /// `{:segment/}` defines a segment, printed only where `{:includesegment name}` or
+    /// `{:includesegment* expression}` names it; `{:inlinesegment name}` …
+    /// `{:inlinesegment/}` and `{:includeinlinesegment name}` do the same within a paragraph.
+    pub subtemplates: bool,
 }
 
 impl Extensions {
@@ -113,6 +123,7 @@ impl Extensions {
         full_tables: true,
         html_extras: true,
         centered_images: true,
+        subtemplates: true,
     };
     pub const NONE: Extensions = Extensions {
         vertical_tables: false,
@@ -127,6 +138,7 @@ impl Extensions {
         full_tables: false,
         html_extras: false,
         centered_images: false,
+        subtemplates: false,
     };
 }
 
@@ -225,6 +237,7 @@ pub struct PackageTemplate {
     max_drawing_id: u32,
     max_footnote_id: u32,
     body: Option<(f64, f64)>,
+    includes: BTreeMap<String, Subtemplate>,
 }
 
 #[derive(Debug)]
@@ -269,7 +282,14 @@ impl PackageTemplate {
             max_footnote_id: max_footnote_id.unwrap_or(0),
             body,
             parts: parsed,
+            includes: BTreeMap::new(),
         })
+    }
+
+    /// Names a subtemplate `{:include}` tags print where their value is `name`, or a list
+    /// holding it. A later subtemplate with the name replaces it.
+    pub fn add_include(&mut self, name: impl Into<String>, include: Subtemplate) {
+        self.includes.insert(name.into(), include);
     }
 
     /// Every part, in the order given, with the template parts filled with `data`.
@@ -291,6 +311,7 @@ impl PackageTemplate {
         let mut notes = Vec::new();
         let mut links: Vec<(String, Vec<String>)> = Vec::new();
         let mut definitions = Vec::new();
+        let mut includes = Vec::new();
         for (name, part) in &self.parts {
             let bytes = match part {
                 PackagePart::Bytes(bytes) => Cow::Borrowed(bytes.as_slice()),
@@ -301,6 +322,9 @@ impl PackageTemplate {
                         notes = filled.footnotes;
                     }
                     definitions.extend(filled.style_definitions);
+                    if !filled.includes.is_empty() {
+                        includes.push((name.clone(), filled.includes));
+                    }
                     if !filled.links.is_empty() {
                         links.push((name.clone(), filled.links));
                     }
@@ -314,6 +338,7 @@ impl PackageTemplate {
         add_links(&mut out, &links);
         restyle_definitions(&mut out, &definitions);
         footnotes::add_footnotes(&mut out, &notes);
+        includes::print_includes(&mut out, &includes, &self.includes, hooks);
         self.document.apply(&mut out);
         out
     }
@@ -370,7 +395,7 @@ fn add_links(parts: &mut Vec<(String, Cow<[u8]>)>, links: &[(String, Vec<String>
 
 /// Adds `relationship` to `part`'s relationships part, creating it when missing, unless one
 /// with `id` is there.
-fn add_relationship(parts: &mut Vec<(String, Cow<[u8]>)>, part: &str, id: &str, relationship: &str) {
+pub(crate) fn add_relationship(parts: &mut Vec<(String, Cow<[u8]>)>, part: &str, id: &str, relationship: &str) {
     let folder = part.rfind('/').map_or("", |at| &part[..at + 1]);
     let rels_path = format!("{folder}_rels/{}.rels", &part[folder.len()..]);
     let rels = match parts.iter().position(|(name, _)| *name == rels_path) {
@@ -394,7 +419,7 @@ pub(crate) fn insert_before_last(xml: &str, close: &str, added: &str) -> String 
     }
 }
 
-fn image_content_type(extension: &str) -> String {
+pub(crate) fn image_content_type(extension: &str) -> String {
     match extension {
         "jpg" | "jpeg" => "image/jpeg".to_string(),
         "svg" => "image/svg+xml".to_string(),

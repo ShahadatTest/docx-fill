@@ -43,10 +43,15 @@ pub(crate) fn add_footnotes(parts: &mut Vec<(String, Cow<[u8]>)>, notes: &[(u32,
         escape(text, &mut written);
         written.push_str("</w:t></w:r></w:p></w:footnote>");
     }
+    append_notes(parts, &written);
+}
 
+/// Adds `written`, whole `<w:footnote>` elements, to the footnotes part, creating the part, its
+/// relationship and content type when the package has none.
+pub(crate) fn append_notes(parts: &mut Vec<(String, Cow<[u8]>)>, written: &str) {
     if let Some(part) = parts.iter_mut().find(|(name, _)| name == FOOTNOTES_PART) {
         let xml = String::from_utf8_lossy(&part.1).into_owned();
-        part.1 = Cow::Owned(insert_before_last(&xml, "</w:footnotes>", &written).into_bytes());
+        part.1 = Cow::Owned(insert_before_last(&xml, "</w:footnotes>", written).into_bytes());
         return;
     }
 

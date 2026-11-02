@@ -61,6 +61,13 @@ pub(crate) enum TagKind {
     FullTable,
     /// `{:#grid name}`: the paragraphs up to `{:/grid}` printed once per item in a grid of cells.
     GridOpen,
+    /// `{:include name}`: subtemplate bodies in place of the tag's paragraph.
+    Include,
+    /// `{:segment name}` or `{:inlinesegment name}`: a segment's definition up to its closing tag.
+    SegmentOpen { is_inline: bool },
+    /// `{:includesegment name}`, `{:includeinlinesegment name}`, or with `*` a segment named by
+    /// the value.
+    IncludeSegment { is_inline: bool, is_dynamic: bool },
 }
 
 /// What a styling tag styles.
@@ -100,6 +107,12 @@ pub(crate) enum BlockKind {
     FullTable { name: String, is_in_cell: bool },
     /// A grid's tag paragraphs and the paragraphs between them, the body.
     Grid { name: String },
+    /// An `{:include}` tag's paragraph.
+    Include { name: String },
+    /// A segment's definition, printed only where included.
+    Segment { name: String },
+    /// An `{:includesegment}` tag's paragraph, or an inline one's tag.
+    IncludeSegment { name: String, is_dynamic: bool },
 }
 
 /// A range of parts a loop or raw tag replaces: `start..end` is printed as `body_start..body_end`
@@ -265,6 +278,7 @@ impl Template {
             BlockKind::Loop { name, .. } | BlockKind::Raw { name } => name,
             BlockKind::Placeholder { names } => names.first().map_or("", String::as_str),
             BlockKind::FullTable { name, .. } | BlockKind::Grid { name } => name,
+            BlockKind::Include { name } | BlockKind::Segment { name } | BlockKind::IncludeSegment { name, .. } => name,
         }
     }
 }
@@ -411,6 +425,25 @@ fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
 }
 
 fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, String)> {
+    if extensions.subtemplates {
+        if matches!(text.trim(), ":segment/" | ":inlinesegment/") {
+            return Some((TagKind::Close, String::new()));
+        }
+        let prefixes = [
+            (":include ", TagKind::Include),
+            (":segment ", TagKind::SegmentOpen { is_inline: false }),
+            (":inlinesegment ", TagKind::SegmentOpen { is_inline: true }),
+            (":includesegment* ", TagKind::IncludeSegment { is_inline: false, is_dynamic: true }),
+            (":includesegment ", TagKind::IncludeSegment { is_inline: false, is_dynamic: false }),
+            (":includeinlinesegment* ", TagKind::IncludeSegment { is_inline: true, is_dynamic: true }),
+            (":includeinlinesegment ", TagKind::IncludeSegment { is_inline: true, is_dynamic: false }),
+        ];
+        for (prefix, kind) in prefixes {
+            if let Some(name) = text.strip_prefix(prefix) {
+                return Some((kind, name.trim().to_string()));
+            }
+        }
+    }
     if extensions.full_tables {
         if let Some(name) = text.strip_prefix(":table ") {
             return Some((TagKind::FullTable, name.trim().to_string()));
@@ -544,7 +577,7 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
     let mut open: Vec<usize> = Vec::new();
     for (index, tag) in tags.iter().enumerate() {
         match tag.kind {
-            TagKind::Open { .. } | TagKind::GridOpen => open.push(index),
+            TagKind::Open { .. } | TagKind::GridOpen | TagKind::SegmentOpen { .. } => open.push(index),
             TagKind::Close => {
                 let Some(opening) = open.pop() else {
                     return Err(FillError::new(format!("The tag \"{}\" has no opening loop tag", tag.text)));
@@ -554,6 +587,10 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                 }
                 if tags[opening].kind == TagKind::GridOpen {
                     blocks.push(expand_grid(tags, paragraphs, opening, index)?);
+                    continue;
+                }
+                if let TagKind::SegmentOpen { is_inline } = tags[opening].kind {
+                    blocks.push(expand_segment(tags, paragraphs, opening, index, is_inline)?);
                     continue;
                 }
                 blocks.push(expand_loop(parts, tags, paragraphs, opening, index, options)?);
@@ -574,6 +611,26 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
             TagKind::Image { is_centered: true, .. } if !tag.is_alone => {
                 return Err(FillError::new(format!("Centered Images should be placed in empty paragraphs, but the tag \"{}\" is not", tag.text)));
             }
+            TagKind::Include | TagKind::IncludeSegment { is_inline: false, .. } => {
+                if !tag.is_alone {
+                    return Err(segment_not_alone());
+                }
+                let (start, end) = find_enclosing(parts, tag.part, PARAGRAPH).ok_or_else(|| not_inside(tag, PARAGRAPH))?;
+                let kind = match tag.kind {
+                    TagKind::IncludeSegment { is_dynamic, .. } => BlockKind::IncludeSegment { name: tag.name.clone(), is_dynamic },
+                    _ => BlockKind::Include { name: tag.name.clone() },
+                };
+                blocks.push(Block { kind, start, end: end + 1, body_start: end + 1, body_end: end + 1, children: Vec::new(), open_tag: index });
+            }
+            TagKind::IncludeSegment { is_inline: true, is_dynamic } => blocks.push(Block {
+                kind: BlockKind::IncludeSegment { name: tag.name.clone(), is_dynamic },
+                start: tag.part,
+                end: tag.part + 1,
+                body_start: tag.part + 1,
+                body_end: tag.part + 1,
+                children: Vec::new(),
+                open_tag: index,
+            }),
             TagKind::FullTable => {
                 if !tag.is_alone {
                     return Err(FillError::new(format!("The table tag \"{}\" should be the only text in its paragraph", tag.text)));
@@ -621,7 +678,34 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
     if let Some(&opening) = open.last() {
         return Err(FillError::new(format!("The loop with tag \"{}\" is unclosed", tags[opening].name)));
     }
+    for tag in tags {
+        if !matches!(tag.kind, TagKind::IncludeSegment { is_dynamic: false, .. }) {
+            continue;
+        }
+        if !blocks.iter().any(|block| matches!(&block.kind, BlockKind::Segment { name } if *name == tag.name)) {
+            return Err(FillError::new(format!("The subsegment for \"{}\" must be defined in order to include it", tag.name)));
+        }
+    }
     Ok(blocks)
+}
+
+fn segment_not_alone() -> FillError {
+    FillError::new("Segment tag should be the only text in a paragraph")
+}
+
+/// A segment's parts: a block segment's tag paragraphs, each holding only its tag, and the
+/// paragraphs between; an inline segment's tags and the parts between.
+fn expand_segment(tags: &[Tag], paragraphs: &[Paragraph], opening: usize, closing: usize, is_inline: bool) -> Result<Block, FillError> {
+    let (open, close) = (&tags[opening], &tags[closing]);
+    let kind = BlockKind::Segment { name: open.name.clone() };
+    if is_inline {
+        return Ok(Block { kind, start: open.part, end: close.part + 1, body_start: open.part + 1, body_end: close.part, children: Vec::new(), open_tag: opening });
+    }
+    let (first, last) = (&paragraphs[open.paragraph], &paragraphs[close.paragraph]);
+    if open.paragraph == close.paragraph || !open.is_alone || !close.is_alone || first.end <= first.start || last.end <= last.start {
+        return Err(segment_not_alone());
+    }
+    Ok(Block { kind, start: first.start, end: last.end + 1, body_start: first.end + 1, body_end: last.start, children: Vec::new(), open_tag: opening })
 }
 
 /// A grid's parts: its tags' paragraphs, each holding only its tag, and the paragraphs between.

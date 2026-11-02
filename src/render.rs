@@ -10,6 +10,7 @@ use crate::images::{Image, MediaUse, body_or_default, drawing_size, drawing_xml}
 use crate::rich_text::{self, RichValue};
 use crate::template::{BlockKind, Part, StyleTarget, TagKind, Template};
 use crate::cell_styling;
+use crate::includes::{INCLUDE_END, INCLUDE_START};
 use crate::xml::{ElementKind, escape, read_attribute};
 
 // A `\n` in a value outside a run: the text continues after a line break.
@@ -21,6 +22,8 @@ const TABLE: &str = "w:tbl";
 const RUN: &str = "w:r";
 // Shapes `{:styleshape}` colours: DrawingML and the VML Word writes as a fallback.
 const SHAPES: [&str; 5] = ["wps:wsp", "v:shape", "v:rect", "v:roundrect", "v:oval"];
+// Segments including themselves stop here.
+const MAX_SEGMENT_DEPTH: usize = 32;
 const SUPERSCRIPT: &str = "<w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>";
 
 /// A tag a module claims, by its prefix in `FillOptions::module_prefixes`.
@@ -71,6 +74,8 @@ pub(crate) struct FilledPart {
     pub links: Vec<String>,
     /// Style definitions to change: their kind, id (`None` for the default) and style.
     pub style_definitions: Vec<(StyleKind, Option<String>, Style)>,
+    /// Subtemplates to print at the include marks, by mark index: the name and the scope.
+    pub includes: Vec<(String, Value)>,
 }
 
 /// A paragraph open in the output.
@@ -98,6 +103,8 @@ struct Render<'a, 'h> {
     /// `{:stylestart}` ranges' styles, by the index their marks carry.
     ranges: Vec<Style>,
     style_definitions: Vec<(StyleKind, Option<String>, Style)>,
+    includes: Vec<(String, Value)>,
+    segment_depth: usize,
     rich_values: Vec<RichValue>,
     media: Vec<MediaUse>,
     footnotes: Vec<(u32, String)>,
@@ -114,7 +121,22 @@ impl Template {
     /// part and relationship are not added: fill a [`crate::PackageTemplate`] for that.
     pub fn render_with(&self, data: &Value, hooks: &mut dyn FillHooks) -> String {
         let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1 };
-        self.fill(data, "", hooks, &mut state).xml
+        let filled = self.fill(data, "", hooks, &mut state);
+        // Only a package prints subtemplates.
+        if filled.includes.is_empty() {
+            return filled.xml;
+        }
+        let mut xml = String::with_capacity(filled.xml.len());
+        let mut is_in_mark = false;
+        for c in filled.xml.chars() {
+            match c {
+                INCLUDE_START => is_in_mark = true,
+                INCLUDE_END => is_in_mark = false,
+                _ if !is_in_mark => xml.push(c),
+                _ => {}
+            }
+        }
+        xml
     }
 
     pub(crate) fn fill(&self, data: &Value, part: &str, hooks: &mut dyn FillHooks, state: &mut FillState) -> FilledPart {
@@ -132,6 +154,8 @@ impl Template {
             shapes: Vec::new(),
             ranges: Vec::new(),
             style_definitions: Vec::new(),
+            includes: Vec::new(),
+            segment_depth: 0,
             rich_values: Vec::new(),
             media: Vec::new(),
             footnotes: Vec::new(),
@@ -140,7 +164,7 @@ impl Template {
         let mut scopes = vec![data];
         render.render_range(0, self.parts.len(), &self.top, &mut scopes);
         let xml = if render.ranges.is_empty() { render.out } else { style_ranges(&render.out, &render.ranges) };
-        FilledPart { xml, media: render.media, footnotes: render.footnotes, links: render.links, style_definitions: render.style_definitions }
+        FilledPart { xml, media: render.media, footnotes: render.footnotes, links: render.links, style_definitions: render.style_definitions, includes: render.includes }
     }
 }
 
@@ -160,6 +184,32 @@ impl<'a> Render<'a, '_> {
                 BlockKind::Raw { name } => {
                     if let Some(value) = look_up(scopes, name) {
                         self.out.push_str(&print_value(value));
+                    }
+                }
+                BlockKind::Segment { .. } => {}
+                BlockKind::IncludeSegment { name, is_dynamic } => {
+                    let wanted = if *is_dynamic { look_up(scopes, name).and_then(Value::as_str) } else { Some(name.as_str()) };
+                    let segment = wanted.and_then(|wanted| template.blocks.iter().find(|each| matches!(&each.kind, BlockKind::Segment { name } if name == wanted)));
+                    let Some(segment) = segment.filter(|_| self.segment_depth < MAX_SEGMENT_DEPTH) else { continue };
+                    self.segment_depth += 1;
+                    self.render_range(segment.body_start, segment.body_end, &segment.children, scopes);
+                    self.segment_depth -= 1;
+                }
+                BlockKind::Include { name } => {
+                    let names: Vec<&str> = match look_up(scopes, name) {
+                        Some(Value::String(name)) => vec![name.as_str()],
+                        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+                        _ => Vec::new(),
+                    };
+                    if names.is_empty() {
+                        continue;
+                    }
+                    let scope = merge_scopes(scopes);
+                    for name in names {
+                        self.out.push(INCLUDE_START);
+                        self.out.push_str(&self.includes.len().to_string());
+                        self.out.push(INCLUDE_END);
+                        self.includes.push((name.to_string(), scope.clone()));
                     }
                 }
                 BlockKind::FullTable { name, is_in_cell } => {
@@ -324,6 +374,7 @@ impl<'a> Render<'a, '_> {
                         }
                         TagKind::Image { cell_width, is_centered } => self.print_image(value(), cell_width, is_centered),
                         TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close | TagKind::FullTable | TagKind::GridOpen => {}
+                        TagKind::Include | TagKind::SegmentOpen { .. } | TagKind::IncludeSegment { .. } => {}
                     }
                 }
             }
@@ -471,6 +522,19 @@ impl<'a> Render<'a, '_> {
             escape(line.strip_suffix('\r').unwrap_or(line), &mut self.out);
         }
     }
+}
+
+/// The scopes' fields in one object, inner ones over outer ones, nulls left out as `look_up`
+/// skips them.
+fn merge_scopes(scopes: &[&Value]) -> Value {
+    let mut merged = serde_json::Map::new();
+    for scope in scopes {
+        let Value::Object(fields) = scope else { continue };
+        for (name, value) in fields.iter().filter(|(_, value)| !value.is_null()) {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 /// `name`'s value in the innermost scope that has it, out to the root. A null counts as
