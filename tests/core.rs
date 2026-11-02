@@ -3,7 +3,7 @@
 mod common;
 
 use common::{cell, document, fill, paragraph, paragraph_texts, read_rows, row, table, text};
-use docx_fill::{FillOptions, ModuleTag, Template, fill_part};
+use docx_fill::{FillHooks, FillOptions, ModuleTag, Template, fill_part};
 use serde_json::{Value, json};
 
 fn fill_error(body: &str) -> String {
@@ -135,9 +135,14 @@ fn hands_module_tags_to_the_module() {
     let options = FillOptions { module_prefixes: vec!["~~".into(), ":stylecell ".into()], ..FillOptions::default() };
     let template = Template::parse(&document(&paragraph(&["{~~notes}|{:stylecell fill}|{plain}"])), &options).unwrap();
 
-    let xml = template.render_with(&json!({ "notes": "<p>n</p>", "plain": "p" }), &mut |tag: ModuleTag| {
-        format!("{}:{}={}", tag.module, tag.name, tag.value.map_or("none".to_string(), |value| value.to_string()))
-    });
+    struct Printer;
+    impl FillHooks for Printer {
+        fn module_tag(&mut self, _part: &str, tag: ModuleTag) -> String {
+            format!("{}:{}={}", tag.module, tag.name, tag.value.map_or("none".to_string(), |value| value.to_string()))
+        }
+    }
+
+    let xml = template.render_with(&json!({ "notes": "<p>n</p>", "plain": "p" }), &mut Printer);
 
     assert_eq!(text(&xml), r#"0:notes="<p>n</p>"|1:fill=none|p"#);
 }

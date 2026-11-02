@@ -58,3 +58,16 @@ fn leaves_the_row_without_the_cells_when_the_list_is_empty() {
 
     assert_eq!(read_rows(&xml), [["Label"]]);
 }
+
+#[test]
+fn repeats_cells_between_vertical_table_tags() {
+    let xml = fill(
+        &table(&[row(&[cell(&["Name"]), cell(&["{:vt#vt}{header}{:vt/vt}"])]), row(&[cell(&["{-w:tr rows}{label}"]), cell(&["{:vt# vt }{value}{:v", "t/vt}{/rows}"])])]),
+        json!({
+            "vt": [{ "header": "H1" }, { "header": "H2" }],
+            "rows": [{ "label": "r1", "vt": [{ "value": "1a" }, { "value": "1b" }] }]
+        }),
+    );
+
+    assert_eq!(read_rows(&xml), [["Name", "H1", "H2"], ["r1", "1a", "1b"]]);
+}

@@ -1,14 +1,15 @@
 //! Parses a part into XML, text and tags, and pairs its loops with the XML they repeat.
 
-use crate::FillError;
-use crate::FillOptions;
-use crate::xml::{ElementKind, Token, tokenize, unescape};
+use crate::xml::{ElementKind, Token, read_attribute, tokenize, unescape};
+use crate::{Delimiters, Extensions, FillError, FillOptions};
 
 const PARAGRAPH: &str = "w:p";
 const TEXT: &str = "w:t";
 const CELL: &str = "w:tc";
 const ROW: &str = "w:tr";
 const PRESERVE_SPACE: &str = " xml:space=\"preserve\"";
+// Word lengths are twentieths of a point; pixels are 1/96 inch.
+pub(crate) const PX_PER_TWIP: f64 = 96.0 / 1440.0;
 
 #[derive(Debug)]
 pub(crate) enum Part {
@@ -17,7 +18,7 @@ pub(crate) enum Part {
     Tag(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TagKind {
     /// `{name}`
     Value,
@@ -29,6 +30,12 @@ pub(crate) enum TagKind {
     Close,
     /// A tag starting with `FillOptions::module_prefixes[index]`.
     Module(usize),
+    /// `{:stylecell name}`: a background for the table cell the tag is in.
+    CellStyle,
+    /// `{~~name}` (block) or `{~name}` (inline): HTML printed as Word runs and paragraphs.
+    RichText { is_block: bool },
+    /// `{%name}` or `{%%name}`: an image filling its table cell, else the page's width.
+    Image { cell_width: Option<f64> },
 }
 
 #[derive(Debug)]
@@ -71,9 +78,14 @@ pub struct Template {
     /// Blocks not inside another, in document order.
     pub(crate) top: Vec<usize>,
     pub(crate) linebreaks: bool,
+    /// The largest drawing id the part uses, so new drawings take ids after it.
+    pub(crate) max_drawing_id: u32,
+    /// Page width and height in pixels, less margins, from the part's last section.
+    pub(crate) body: Option<(f64, f64)>,
 }
 
-/// A tag found in a paragraph's joined text, by byte offsets of its `{` and after its `}`.
+/// A tag found in a paragraph's joined text: byte offsets of its opening delimiter and after its
+/// closing one.
 struct FoundTag {
     start: usize,
     end: usize,
@@ -101,7 +113,7 @@ impl Template {
         let mut joined_texts = Vec::with_capacity(text_tokens.len());
         for texts in &text_tokens {
             let joined: String = texts.iter().map(|&i| text_of(&tokens[i])).collect();
-            found.push(find_tags(&joined)?);
+            found.push(find_tags(&joined, &options.delimiters)?);
             joined_texts.push(joined);
         }
 
@@ -153,8 +165,22 @@ impl Template {
             tag.is_alone = paragraph.len() == 1 && paragraph[0].end - paragraph[0].start == joined_texts[tag.paragraph].len();
         }
 
+        for tag in &mut tags {
+            if let TagKind::Image { cell_width } = &mut tag.kind {
+                *cell_width = read_cell_width(&parts, tag.part);
+            }
+        }
+
         let blocks = pair_blocks(&parts, &tags, &paragraphs, options)?;
-        let mut template = Template { parts, tags, blocks, top: Vec::new(), linebreaks: options.linebreaks };
+        let mut template = Template {
+            max_drawing_id: crate::images::read_max_drawing_id(xml),
+            body: crate::images::read_body_size(xml),
+            parts,
+            tags,
+            blocks,
+            top: Vec::new(),
+            linebreaks: options.linebreaks,
+        };
         template.nest_blocks()?;
         Ok(template)
     }
@@ -204,7 +230,7 @@ impl Builder {
                 self.parts.push(Part::Text(joined[cursor..tag.start].to_string()));
             }
             if tag.start >= offset {
-                let written = &joined[tag.start + 1..tag.end - 1];
+                let written = &joined[tag.start + options.delimiters.start.len()..tag.end - options.delimiters.end.len()];
                 let (kind, name) = read_tag(&unescape(written), options);
                 self.tags.push(Tag { kind, name, text: written.to_string(), part: self.parts.len(), paragraph, is_alone: false });
                 self.parts.push(Part::Tag(self.tags.len() - 1));
@@ -270,27 +296,33 @@ fn preserve_space(raw: &str) -> String {
     format!("{}{PRESERVE_SPACE}{}", &raw[..at], &raw[at..])
 }
 
-/// The `{…}` tags in a paragraph's joined text.
-fn find_tags(text: &str) -> Result<Vec<FoundTag>, FillError> {
+/// The tags in a paragraph's joined text.
+fn find_tags(text: &str, delimiters: &Delimiters) -> Result<Vec<FoundTag>, FillError> {
+    let (start, end) = (delimiters.start.as_str(), delimiters.end.as_str());
     let mut tags = Vec::new();
     let mut open = None;
-    for (at, byte) in text.bytes().enumerate() {
-        match (byte, open) {
-            (b'{', None) => open = Some(at),
-            (b'{', Some(start)) => return Err(unclosed_tag(&text[start..at])),
-            (b'}', Some(start)) => {
-                tags.push(FoundTag { start, end: at + 1 });
-                open = None;
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if rest.starts_with(start) {
+            if let Some(opened) = open {
+                return Err(unclosed_tag(&text[opened..at]));
             }
-            (b'}', None) => {
+            open = Some(at);
+            at += start.len();
+        } else if rest.starts_with(end) {
+            let Some(opened) = open.take() else {
                 let context_start = tags.last().map_or(0, |tag: &FoundTag| tag.end);
                 return Err(FillError::new(format!("The tag beginning with \"{}\" is unopened", unescape(&text[context_start..at]))));
-            }
-            _ => {}
+            };
+            at += end.len();
+            tags.push(FoundTag { start: opened, end: at });
+        } else {
+            at += rest.chars().next().map_or(1, char::len_utf8);
         }
     }
     match open {
-        Some(start) => Err(unclosed_tag(&text[start..])),
+        Some(opened) => Err(unclosed_tag(&text[opened..])),
         None => Ok(tags),
     }
 }
@@ -303,6 +335,9 @@ fn unclosed_tag(context: &str) -> FillError {
 fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
     if let Some((index, prefix)) = options.module_prefixes.iter().enumerate().find(|(_, prefix)| text.starts_with(prefix.as_str())) {
         return (TagKind::Module(index), text[prefix.len()..].to_string());
+    }
+    if let Some(found) = read_extension_tag(text, &options.extensions) {
+        return found;
     }
 
     let rest = text.get(1..).unwrap_or_default().to_string();
@@ -318,6 +353,55 @@ fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
         }
         _ => (TagKind::Value, text.to_string()),
     }
+}
+
+fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, String)> {
+    if extensions.vertical_tables {
+        // `{:vt#cols}` … `{:vt/cols}` repeat the cells from the opening tag's to the closing tag's.
+        if let Some(name) = text.strip_prefix(":vt#") {
+            return Some((TagKind::Open { is_inverted: false, element: Some(CELL.to_string()) }, name.trim().to_string()));
+        }
+        if let Some(name) = text.strip_prefix(":vt/") {
+            return Some((TagKind::Close, name.trim().to_string()));
+        }
+    }
+    if extensions.cell_styling
+        && let Some(name) = text.strip_prefix(":stylecell ")
+    {
+        return Some((TagKind::CellStyle, name.trim().to_string()));
+    }
+    if extensions.rich_text {
+        if let Some(name) = text.strip_prefix("~~") {
+            return Some((TagKind::RichText { is_block: true }, name.to_string()));
+        }
+        if let Some(name) = text.strip_prefix('~') {
+            return Some((TagKind::RichText { is_block: false }, name.to_string()));
+        }
+    }
+    if extensions.images {
+        let name = text.strip_prefix("%%").or_else(|| text.strip_prefix('%'))?;
+        return Some((TagKind::Image { cell_width: None }, name.trim().to_string()));
+    }
+    None
+}
+
+/// The width in pixels of the innermost table cell around part `at`, when its `<w:tcW>` gives
+/// one in twips.
+fn read_cell_width(parts: &[Part], at: usize) -> Option<f64> {
+    let (start, _) = find_enclosing(parts, at, CELL)?;
+    for part in &parts[start + 1..at] {
+        let Part::Element { name, raw, .. } = part else { continue };
+        if name == PARAGRAPH {
+            return None;
+        }
+        if name == "w:tcW" {
+            if read_attribute(raw, "w:type") != Some("dxa") {
+                return None;
+            }
+            return read_attribute(raw, "w:w")?.parse::<f64>().ok().map(|twips| twips * PX_PER_TWIP);
+        }
+    }
+    None
 }
 
 /// Pairs each loop's tags and works out the parts every loop and raw tag replaces.
@@ -348,7 +432,7 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                     open_tag: index,
                 });
             }
-            TagKind::Value | TagKind::Module(_) => {}
+            TagKind::Value | TagKind::Module(_) | TagKind::CellStyle | TagKind::RichText { .. } | TagKind::Image { .. } => {}
         }
     }
     if let Some(&opening) = open.last() {

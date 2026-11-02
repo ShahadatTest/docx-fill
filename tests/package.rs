@@ -26,7 +26,7 @@ fn fills_the_body_headers_and_footers_and_keeps_other_parts() {
 
     let filled = template.render(&json!({ "v": "V" }));
 
-    let names: Vec<&str> = filled.iter().map(|(name, _)| *name).collect();
+    let names: Vec<&str> = filled.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["[Content_Types].xml", "word/document.xml", "word/header1.xml", "word/footer2.xml", "word/styles.xml"]);
     let texts: Vec<String> = filled[1..4].iter().map(|(_, bytes)| text(std::str::from_utf8(bytes).unwrap())).collect();
     assert_eq!(texts, ["body V", "header V", "footer V"]);

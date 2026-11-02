@@ -126,3 +126,30 @@ pub(crate) fn escape(text: &str, out: &mut String) {
         }
     }
 }
+
+/// The value of `name="…"` in an element's raw text.
+pub(crate) fn read_attribute<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = raw;
+    while let Some(at) = rest.find(name) {
+        let before = rest[..at].chars().next_back();
+        let after = &rest[at + name.len()..];
+        rest = after;
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let Some(value) = after.trim_start().strip_prefix('=') else { continue };
+        let value = value.trim_start();
+        let quote = value.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let end = value[1..].find(quote)?;
+        return Some(&value[1..1 + end]);
+    }
+    None
+}
+
+/// Byte offset of `inner`, a slice of `outer`, within it.
+pub(crate) fn offset_in(outer: &str, inner: &str) -> usize {
+    inner.as_ptr() as usize - outer.as_ptr() as usize
+}
