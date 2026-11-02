@@ -14,10 +14,15 @@
 //! Built from the WordprocessingML spec and docxtemplater's documented behaviour.
 
 mod cell_styling;
+mod document_edits;
 mod empty_last_page;
+mod footnotes;
 mod images;
+mod properties;
 mod render;
 mod rich_text;
+mod styling;
+mod table_merge;
 mod template;
 mod xml;
 
@@ -27,6 +32,7 @@ use std::fmt;
 
 use serde_json::Value;
 
+pub use document_edits::{DocumentEdits, Margins};
 pub use empty_last_page::drop_empty_last_page;
 pub use images::Image;
 pub use render::{FillHooks, ModuleTag, NoHooks};
@@ -35,8 +41,8 @@ pub use template::Template;
 use images::MediaUse;
 use render::FillState;
 
-const DOCUMENT_PART: &str = "word/document.xml";
-const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
+pub(crate) const DOCUMENT_PART: &str = "word/document.xml";
+pub(crate) const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const IMAGE_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const RELATIONSHIPS_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 // Images fill their container less 5% for cell padding.
@@ -66,11 +72,44 @@ pub struct Extensions {
     pub rich_text: bool,
     /// `{%name}` and `{%%name}`: an image from [`FillHooks::image`].
     pub images: bool,
+    /// `{:merge-cells-col 1,2}`, `{:merge-cells-col rtl 1,2}` and `{:merge-cells-row 1,-1}`: merges
+    /// neighbouring cells of the tag's table that print the same, non-empty text.
+    pub table_merge: bool,
+    /// `{:stylepar name}`, `{:stylerow name}` and `{:stylerun name}`: a style value (see
+    /// [`FillOptions`]) on the tag's paragraph, row or run.
+    pub styling: bool,
+    /// `{r@name}`: replaces the tag's run with the value as raw `<w:r>` XML.
+    pub word_run: bool,
+    /// `{?name}`: drops the tag's paragraph for a value a loop skips, repeats it per item of a list
+    /// and keeps it once otherwise. A list item or text value prints in the tag's place.
+    pub paragraph_placeholder: bool,
+    /// `{:footnote name}`: a footnote holding the value, in the body only.
+    pub footnotes: bool,
 }
 
 impl Extensions {
-    pub const ALL: Extensions = Extensions { vertical_tables: true, cell_styling: true, rich_text: true, images: true };
-    pub const NONE: Extensions = Extensions { vertical_tables: false, cell_styling: false, rich_text: false, images: false };
+    pub const ALL: Extensions = Extensions {
+        vertical_tables: true,
+        cell_styling: true,
+        rich_text: true,
+        images: true,
+        table_merge: true,
+        styling: true,
+        word_run: true,
+        paragraph_placeholder: true,
+        footnotes: true,
+    };
+    pub const NONE: Extensions = Extensions {
+        vertical_tables: false,
+        cell_styling: false,
+        rich_text: false,
+        images: false,
+        table_merge: false,
+        styling: false,
+        word_run: false,
+        paragraph_placeholder: false,
+        footnotes: false,
+    };
 }
 
 /// How a template is read and filled.
@@ -89,6 +128,8 @@ pub struct FillOptions {
     /// Tag prefixes handed to [`FillHooks::module_tag`] instead of printed. They are checked
     /// before the extensions'.
     pub module_prefixes: Vec<String>,
+    /// Edits to the whole package, applied when filling one.
+    pub document: DocumentEdits,
 }
 
 impl Default for FillOptions {
@@ -102,6 +143,7 @@ impl Default for FillOptions {
             extensions: Extensions::ALL,
             drop_empty_last_page: true,
             module_prefixes: Vec::new(),
+            document: DocumentEdits::default(),
         }
     }
 }
@@ -158,7 +200,9 @@ pub fn fill_part(xml: &str, data: &Value, options: &FillOptions) -> Result<Strin
 pub struct PackageTemplate {
     parts: Vec<(String, PackagePart)>,
     drop_empty_last_page: bool,
+    document: DocumentEdits,
     max_drawing_id: u32,
+    max_footnote_id: u32,
     body: Option<(f64, f64)>,
 }
 
@@ -193,7 +237,18 @@ impl PackageTemplate {
         });
         let max_drawing_id = templates().map(|(_, template)| template.max_drawing_id).max().unwrap_or(0);
         let body = templates().find(|(name, _)| *name == DOCUMENT_PART).and_then(|(_, template)| template.body);
-        Ok(PackageTemplate { drop_empty_last_page: options.drop_empty_last_page, max_drawing_id, body, parts: parsed })
+        let max_footnote_id = parsed.iter().find_map(|(name, part)| match part {
+            PackagePart::Bytes(bytes) if name == footnotes::FOOTNOTES_PART => Some(footnotes::read_max_id(&String::from_utf8_lossy(bytes))),
+            _ => None,
+        });
+        Ok(PackageTemplate {
+            drop_empty_last_page: options.drop_empty_last_page,
+            document: options.document.clone(),
+            max_drawing_id,
+            max_footnote_id: max_footnote_id.unwrap_or(0),
+            body,
+            parts: parsed,
+        })
     }
 
     /// Every part, in the order given, with the template parts filled with `data`.
@@ -204,15 +259,24 @@ impl PackageTemplate {
     /// [`PackageTemplate::render`], asking `hooks` for module tags and images. Images add their
     /// media parts, relationships and content types.
     pub fn render_with(&self, data: &Value, hooks: &mut dyn FillHooks) -> Vec<(String, Cow<'_, [u8]>)> {
-        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: self.body, container_fill: CONTAINER_FILL };
+        let mut state = FillState {
+            next_drawing_id: self.max_drawing_id + 1,
+            body: self.body,
+            container_fill: CONTAINER_FILL,
+            next_footnote_id: self.max_footnote_id + 1,
+        };
         let mut out: Vec<(String, Cow<[u8]>)> = Vec::with_capacity(self.parts.len());
         let mut media: Vec<(String, MediaUse)> = Vec::new();
+        let mut notes = Vec::new();
         for (name, part) in &self.parts {
             let bytes = match part {
                 PackagePart::Bytes(bytes) => Cow::Borrowed(bytes.as_slice()),
                 PackagePart::Template(template) => {
                     let filled = template.fill(data, name, hooks, &mut state);
                     media.extend(filled.media.into_iter().map(|used| (name.clone(), used)));
+                    if name == DOCUMENT_PART {
+                        notes = filled.footnotes;
+                    }
                     let xml = if self.drop_empty_last_page && name == DOCUMENT_PART { drop_empty_last_page(&filled.xml) } else { filled.xml };
                     Cow::Owned(xml.into_bytes())
                 }
@@ -220,6 +284,8 @@ impl PackageTemplate {
             out.push((name.clone(), bytes));
         }
         add_media(&mut out, &media);
+        footnotes::add_footnotes(&mut out, &notes);
+        self.document.apply(&mut out);
         out
     }
 }
@@ -260,7 +326,7 @@ fn add_media(parts: &mut Vec<(String, Cow<[u8]>)>, media: &[(String, MediaUse)])
     }
 }
 
-fn insert_before_last(xml: &str, close: &str, added: &str) -> String {
+pub(crate) fn insert_before_last(xml: &str, close: &str, added: &str) -> String {
     match xml.rfind(close) {
         Some(at) => format!("{}{added}{}", &xml[..at], &xml[at..]),
         None => xml.to_string(),

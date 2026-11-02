@@ -1,5 +1,6 @@
 //! Parses a part into XML, text and tags, and pairs its loops with the XML they repeat.
 
+use crate::table_merge::{Merge, read_merge};
 use crate::xml::{ElementKind, Token, read_attribute, tokenize, unescape};
 use crate::{Delimiters, Extensions, FillError, FillOptions};
 
@@ -38,6 +39,24 @@ pub(crate) enum TagKind {
     RichText { is_block: bool },
     /// `{%name}` or `{%%name}`: an image filling its table cell, else the page's width.
     Image { cell_width: Option<f64> },
+    /// `{:stylepar name}`, `{:stylerow name}` or `{:stylerun name}`.
+    Style(StyleTarget),
+    /// `{:merge-cells-col 1,2}` or `{:merge-cells-row}`: merges equal cells of the tag's table.
+    TableMerge(Merge),
+    /// `{r@name}`: replaces its run with the value as raw XML.
+    RawRun,
+    /// `{?name}`: keeps, drops or repeats its paragraph by the value.
+    Placeholder,
+    /// `{:footnote name}`: a footnote holding the value.
+    Footnote,
+}
+
+/// What a styling tag styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StyleTarget {
+    Paragraph,
+    Row,
+    Run,
 }
 
 #[derive(Debug)]
@@ -59,6 +78,8 @@ pub(crate) struct Tag {
 pub(crate) enum BlockKind {
     Loop { name: String, is_inverted: bool },
     Raw { name: String },
+    /// A paragraph holding `{?name}` tags, printed by their values.
+    Placeholder { names: Vec<String> },
 }
 
 /// A range of parts a loop or raw tag replaces: `start..end` is printed as `body_start..body_end`
@@ -174,6 +195,7 @@ impl Template {
             match &mut tag.kind {
                 TagKind::Image { cell_width } => *cell_width = read_cell_width(&parts, tag.part),
                 TagKind::Value if options.linebreaks => tag.run_props = read_run_props(&parts, tag.part),
+                TagKind::Footnote => tag.run_props = read_run_props(&parts, tag.part),
                 _ => {}
             }
         }
@@ -217,6 +239,7 @@ impl Template {
     fn block_name(&self, block: usize) -> &str {
         match &self.blocks[block].kind {
             BlockKind::Loop { name, .. } | BlockKind::Raw { name } => name,
+            BlockKind::Placeholder { names } => names.first().map_or("", String::as_str),
         }
     }
 }
@@ -363,6 +386,36 @@ fn read_tag(text: &str, options: &FillOptions) -> (TagKind, String) {
 }
 
 fn read_extension_tag(text: &str, extensions: &Extensions) -> Option<(TagKind, String)> {
+    if extensions.table_merge {
+        for (prefix, is_columns) in [(":merge-cells-col", true), (":merge-cells-row", false)] {
+            let Some(rest) = text.strip_prefix(prefix) else { continue };
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return Some((TagKind::TableMerge(read_merge(is_columns, rest)), String::new()));
+            }
+        }
+    }
+    if extensions.styling {
+        for (prefix, target) in [(":stylepar ", StyleTarget::Paragraph), (":stylerow ", StyleTarget::Row), (":stylerun ", StyleTarget::Run)] {
+            if let Some(name) = text.strip_prefix(prefix) {
+                return Some((TagKind::Style(target), name.trim().to_string()));
+            }
+        }
+    }
+    if extensions.footnotes
+        && let Some(name) = text.strip_prefix(":footnote ")
+    {
+        return Some((TagKind::Footnote, name.trim().to_string()));
+    }
+    if extensions.word_run
+        && let Some(name) = text.strip_prefix("r@")
+    {
+        return Some((TagKind::RawRun, name.trim().to_string()));
+    }
+    if extensions.paragraph_placeholder
+        && let Some(name) = text.strip_prefix('?')
+    {
+        return Some((TagKind::Placeholder, name.trim().to_string()));
+    }
     if extensions.vertical_tables {
         // `{:vt#cols}` … `{:vt/cols}` repeat the cells from the opening tag's to the closing tag's.
         if let Some(name) = text.strip_prefix(":vt#") {
@@ -446,8 +499,9 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                 }
                 blocks.push(expand_loop(parts, tags, paragraphs, opening, index, options)?);
             }
-            TagKind::Raw => {
-                let (start, end) = find_enclosing(parts, tag.part, PARAGRAPH).ok_or_else(|| not_inside(tag, PARAGRAPH))?;
+            TagKind::Raw | TagKind::RawRun => {
+                let element = if tag.kind == TagKind::Raw { PARAGRAPH } else { RUN };
+                let (start, end) = find_enclosing(parts, tag.part, element).ok_or_else(|| not_inside(tag, element))?;
                 blocks.push(Block {
                     kind: BlockKind::Raw { name: tag.name.clone() },
                     start,
@@ -458,7 +512,31 @@ fn pair_blocks(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], options: 
                     open_tag: index,
                 });
             }
-            TagKind::Value | TagKind::Module(_) | TagKind::CellStyle | TagKind::RichText { .. } | TagKind::Image { .. } => {}
+            TagKind::Placeholder => {
+                let (start, end) = find_enclosing(parts, tag.part, PARAGRAPH).ok_or_else(|| not_inside(tag, PARAGRAPH))?;
+                // One block per paragraph, naming each of its placeholders.
+                if let Some(Block { kind: BlockKind::Placeholder { names }, .. }) = blocks.iter_mut().find(|block| block.start == start && matches!(block.kind, BlockKind::Placeholder { .. })) {
+                    names.push(tag.name.clone());
+                    continue;
+                }
+                blocks.push(Block {
+                    kind: BlockKind::Placeholder { names: vec![tag.name.clone()] },
+                    start,
+                    end: end + 1,
+                    body_start: start,
+                    body_end: end + 1,
+                    children: Vec::new(),
+                    open_tag: index,
+                });
+            }
+            TagKind::Value
+            | TagKind::Module(_)
+            | TagKind::CellStyle
+            | TagKind::RichText { .. }
+            | TagKind::Image { .. }
+            | TagKind::Style(_)
+            | TagKind::TableMerge(_)
+            | TagKind::Footnote => {}
         }
     }
     if let Some(&opening) = open.last() {
@@ -479,7 +557,10 @@ fn expand_loop(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], opening: 
     let kind = BlockKind::Loop { name: open.name.clone(), is_inverted: *is_inverted };
     let block = |start, end, body_start, body_end| Block { kind, start, end, body_start, body_end, children: Vec::new(), open_tag: opening };
 
-    let element = element.clone().or_else(|| is_crossing_cells(parts, open.part, close.part).then(|| ROW.to_string()));
+    let element = match element {
+        Some(element) => Some(element.clone()),
+        None => is_crossing_cells(parts, open.part, close.part).map_err(|_| misplaced_loop(open))?.then(|| ROW.to_string()),
+    };
     if let Some(element) = element {
         let (start, _) = find_enclosing(parts, open.part, &element).ok_or_else(|| not_inside(open, &element))?;
         let (_, end) = find_enclosing(parts, close.part, &element).ok_or_else(|| not_inside(close, &element))?;
@@ -496,8 +577,17 @@ fn expand_loop(parts: &[Part], tags: &[Tag], paragraphs: &[Paragraph], opening: 
     Ok(block(open.part, close.part + 1, open.part + 1, close.part))
 }
 
-fn is_crossing_cells(parts: &[Part], from: usize, to: usize) -> bool {
-    parts[from..to].iter().any(|part| matches!(part, Part::Element { kind: ElementKind::Open | ElementKind::Close, name, .. } if name == CELL))
+/// Whether a loop's tags sit in different table cells. An error when only one is in a cell.
+fn is_crossing_cells(parts: &[Part], from: usize, to: usize) -> Result<bool, ()> {
+    match (find_enclosing(parts, from, CELL), find_enclosing(parts, to, CELL)) {
+        (Some(open), Some(close)) => Ok(open != close),
+        (None, None) => Ok(false),
+        _ => Err(()),
+    }
+}
+
+fn misplaced_loop(tag: &Tag) -> FillError {
+    FillError::new(format!("The position of the loop tags \"{}\" would produce invalid XML", tag.name))
 }
 
 /// The start and end parts of the innermost `element` around part `at`.

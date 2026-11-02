@@ -2,16 +2,22 @@
 
 use serde_json::Value;
 
-use crate::cell_styling::{read_fill, shade_cell};
+use crate::properties::edit_each;
+use crate::styling::{Style, read_style, style_cell, style_paragraph, style_row, style_run};
+use crate::table_merge::{Merge, merge_table};
 use crate::images::{Image, MediaUse, body_or_default, drawing_size, drawing_xml};
 use crate::rich_text::{self, RichValue};
-use crate::template::{BlockKind, Part, TagKind, Template};
+use crate::template::{BlockKind, Part, StyleTarget, TagKind, Template};
 use crate::xml::{ElementKind, escape};
 
 // A `\n` in a value outside a run: the text continues after a line break.
 const LINE_BREAK: &str = "</w:t><w:br/><w:t xml:space=\"preserve\">";
 const PARAGRAPH: &str = "w:p";
 const CELL: &str = "w:tc";
+const ROW: &str = "w:tr";
+const TABLE: &str = "w:tbl";
+const RUN: &str = "w:r";
+const SUPERSCRIPT: &str = "<w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>";
 
 /// A tag a module claims, by its prefix in `FillOptions::module_prefixes`.
 pub struct ModuleTag<'a> {
@@ -48,12 +54,15 @@ pub(crate) struct FillState {
     pub body: Option<(f64, f64)>,
     /// Images `{%name}` sizes to fill, as a share of their container's width.
     pub container_fill: f64,
+    pub next_footnote_id: u32,
 }
 
 /// A filled part and the media its drawings show.
 pub(crate) struct FilledPart {
     pub xml: String,
     pub media: Vec<MediaUse>,
+    /// Footnote ids and their text, referenced from the part.
+    pub footnotes: Vec<(u32, String)>,
 }
 
 struct Render<'a, 'h> {
@@ -62,12 +71,17 @@ struct Render<'a, 'h> {
     hooks: &'h mut dyn FillHooks,
     state: &'h mut FillState,
     out: String,
-    /// Output offsets of the paragraphs open now, with the rich text marks each holds.
-    paragraphs: Vec<(usize, bool)>,
-    /// Output offsets of the table cells open now, with the fill each was given.
-    cells: Vec<(usize, Option<String>)>,
+    /// Output offsets of the paragraphs open now, whether each holds rich text marks, and its
+    /// style.
+    paragraphs: Vec<(usize, bool, Option<Style>)>,
+    /// Output offsets of the elements open now, with the style or merges each was given.
+    cells: Vec<(usize, Option<Style>)>,
+    rows: Vec<(usize, Option<Style>)>,
+    runs: Vec<(usize, Option<Style>)>,
+    tables: Vec<(usize, Vec<Merge>)>,
     rich_values: Vec<RichValue>,
     media: Vec<MediaUse>,
+    footnotes: Vec<(u32, String)>,
 }
 
 impl Template {
@@ -79,7 +93,7 @@ impl Template {
     /// The part filled with `data`, asking `hooks` for module tags and images. An image's media
     /// part and relationship are not added: fill a [`crate::PackageTemplate`] for that.
     pub fn render_with(&self, data: &Value, hooks: &mut dyn FillHooks) -> String {
-        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL };
+        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1 };
         self.fill(data, "", hooks, &mut state).xml
     }
 
@@ -92,12 +106,16 @@ impl Template {
             out: String::with_capacity(self.parts.len() * 16),
             paragraphs: Vec::new(),
             cells: Vec::new(),
+            rows: Vec::new(),
+            runs: Vec::new(),
+            tables: Vec::new(),
             rich_values: Vec::new(),
             media: Vec::new(),
+            footnotes: Vec::new(),
         };
         let mut scopes = vec![data];
         render.render_range(0, self.parts.len(), &self.top, &mut scopes);
-        FilledPart { xml: render.out, media: render.media }
+        FilledPart { xml: render.out, media: render.media, footnotes: render.footnotes }
     }
 }
 
@@ -117,6 +135,29 @@ impl<'a> Render<'a, '_> {
                 BlockKind::Raw { name } => {
                     if let Some(value) = look_up(scopes, name) {
                         self.out.push_str(&print_value(value));
+                    }
+                }
+                BlockKind::Placeholder { names } => {
+                    let values: Vec<Option<&Value>> = names.iter().map(|name| look_up(scopes, name)).collect();
+                    if !values.iter().all(|value| is_shown(*value)) {
+                        continue;
+                    }
+                    // The first list repeats the paragraph; else the first object is its scope.
+                    let body = |render: &mut Self, scopes: &mut Vec<&'a Value>| render.render_range(block.body_start, block.body_end, &block.children, scopes);
+                    match values.iter().flatten().find(|value| value.is_array()).or_else(|| values.iter().flatten().find(|value| value.is_object())) {
+                        Some(Value::Array(items)) => {
+                            for item in items {
+                                scopes.push(item);
+                                body(self, scopes);
+                                scopes.pop();
+                            }
+                        }
+                        Some(object) => {
+                            scopes.push(object);
+                            body(self, scopes);
+                            scopes.pop();
+                        }
+                        None => body(self, scopes),
                     }
                 }
                 BlockKind::Loop { name, is_inverted: true } => {
@@ -169,10 +210,37 @@ impl<'a> Render<'a, '_> {
                             self.out.push_str(&printed);
                         }
                         TagKind::CellStyle => {
-                            if let (Some(fill), Some(cell)) = (read_fill(value()), self.cells.last_mut()) {
-                                cell.1 = Some(fill);
+                            if let (Some(style), Some(cell)) = (read_style(value()), self.cells.last_mut()) {
+                                cell.1 = Some(style);
                             }
                         }
+                        TagKind::Style(target) => {
+                            let frame = match target {
+                                StyleTarget::Paragraph => self.paragraphs.last_mut().map(|frame| &mut frame.2),
+                                StyleTarget::Row => self.rows.last_mut().map(|frame| &mut frame.1),
+                                StyleTarget::Run => self.runs.last_mut().map(|frame| &mut frame.1),
+                            };
+                            if let (Some(style), Some(frame)) = (read_style(value()), frame) {
+                                *frame = Some(style);
+                            }
+                        }
+                        TagKind::TableMerge(ref merge) => {
+                            if let Some(table) = self.tables.last_mut() {
+                                table.1.push(merge.clone());
+                            }
+                        }
+                        TagKind::Placeholder => {
+                            // A list's item prints in its own paragraph.
+                            let printed = match value() {
+                                Some(Value::Array(_)) => scopes.last().filter(|item| !item.is_object() && !item.is_array()).map(|item| print_value(item)),
+                                Some(Value::Bool(_) | Value::Object(_)) | None => None,
+                                Some(value) => Some(print_value(value)),
+                            };
+                            if let Some(printed) = printed {
+                                escape(&printed, &mut self.out);
+                            }
+                        }
+                        TagKind::Footnote => self.print_footnote(value(), tag.run_props.as_deref()),
                         TagKind::RichText { is_block } => {
                             let html = value().and_then(Value::as_str).unwrap_or_default().to_string();
                             self.out.push_str(&rich_text::mark(self.rich_values.len()));
@@ -182,34 +250,78 @@ impl<'a> Render<'a, '_> {
                             }
                         }
                         TagKind::Image { cell_width } => self.print_image(value(), cell_width),
-                        TagKind::Raw | TagKind::Open { .. } | TagKind::Close => {}
+                        TagKind::Raw | TagKind::RawRun | TagKind::Open { .. } | TagKind::Close => {}
                     }
                 }
             }
         }
     }
 
-    /// Prints an element, rewriting a paragraph with rich text, or a styled cell, as it closes.
+    /// Prints an element, rewriting a paragraph with rich text, or a styled or merged element, as
+    /// it closes.
     fn print_element(&mut self, kind: ElementKind, name: &str, raw: &str) {
         let start = self.out.len();
         self.out.push_str(raw);
         match (kind, name) {
-            (ElementKind::Open, PARAGRAPH) => self.paragraphs.push((start, false)),
+            (ElementKind::Open, PARAGRAPH) => self.paragraphs.push((start, false, None)),
             (ElementKind::Open, CELL) => self.cells.push((start, None)),
+            (ElementKind::Open, ROW) => self.rows.push((start, None)),
+            (ElementKind::Open, RUN) => self.runs.push((start, None)),
+            (ElementKind::Open, TABLE) => self.tables.push((start, Vec::new())),
             (ElementKind::Close, PARAGRAPH) => {
-                if let Some((opened, true)) = self.paragraphs.pop() {
-                    let written = rich_text::write_paragraph(&self.out[opened..], &self.rich_values);
-                    self.out.replace_range(opened.., &written);
+                let Some((opened, has_rich_text, style)) = self.paragraphs.pop() else { return };
+                if !has_rich_text && style.is_none() {
+                    return;
                 }
+                let mut written = if has_rich_text { rich_text::write_paragraph(&self.out[opened..], &self.rich_values) } else { self.out[opened..].to_string() };
+                if let Some(style) = style {
+                    written = edit_each(&written, PARAGRAPH, |paragraph| style_paragraph(paragraph, &style, true));
+                }
+                self.out.replace_range(opened.., &written);
             }
             (ElementKind::Close, CELL) => {
-                if let Some((opened, Some(fill))) = self.cells.pop() {
-                    let shaded = shade_cell(&self.out[opened..], &fill);
-                    self.out.replace_range(opened.., &shaded);
+                let frame = self.cells.pop();
+                self.restyle(frame, style_cell);
+            }
+            (ElementKind::Close, ROW) => {
+                let frame = self.rows.pop();
+                self.restyle(frame, style_row);
+            }
+            (ElementKind::Close, RUN) => {
+                let frame = self.runs.pop();
+                self.restyle(frame, style_run);
+            }
+            (ElementKind::Close, TABLE) => {
+                if let Some((opened, merges)) = self.tables.pop().filter(|(_, merges)| !merges.is_empty()) {
+                    let merged = merge_table(&self.out[opened..], &merges);
+                    self.out.replace_range(opened.., &merged);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Restyles the element a frame opened, now closed, when its frame has a style.
+    fn restyle(&mut self, frame: Option<(usize, Option<Style>)>, styled: fn(&str, &Style) -> String) {
+        if let Some((opened, Some(style))) = frame {
+            let written = styled(&self.out[opened..], &style);
+            self.out.replace_range(opened.., &written);
+        }
+    }
+
+    /// Ends the tag's run, adds a superscript run referencing a new footnote, and goes on in a
+    /// run formatted as the tag's.
+    fn print_footnote(&mut self, value: Option<&Value>, run_props: Option<&str>) {
+        let Some(text) = value.filter(|value| is_truthy(value)).map(print_value) else { return };
+        let Some(props) = run_props else { return };
+        // Footnotes belong to the body; a single part filled alone counts as one.
+        if !(self.part.is_empty() || self.part == crate::DOCUMENT_PART) {
+            return;
+        }
+        let id = self.state.next_footnote_id;
+        self.state.next_footnote_id += 1;
+        self.out.push_str(&format!("</w:t></w:r><w:r>{SUPERSCRIPT}<w:footnoteReference w:id=\"{id}\"/></w:r><w:r>{props}<w:t xml:space=\"preserve\">"));
+        self.footnotes.push((id, text));
     }
 
     fn print_image(&mut self, value: Option<&Value>, cell_width: Option<f64>) {
@@ -301,8 +413,19 @@ fn print_number(number: &serde_json::Number) -> String {
         return number.to_string();
     }
     let float = number.as_f64().unwrap_or_default();
+    if float == 0.0 {
+        return "0".to_string();
+    }
+    // JavaScript writes very large and very small numbers with an exponent, signed: 1e+21, 1e-7.
+    if float.abs() >= 1e21 || float.abs() < 1e-6 {
+        let written = format!("{float:e}");
+        return match written.split_once('e') {
+            Some((digits, exponent)) if !exponent.starts_with('-') => format!("{digits}e+{exponent}"),
+            _ => written,
+        };
+    }
     // Whole floats print without a fraction, as in JavaScript.
-    if float.fract() == 0.0 && float.abs() < 1e21 {
+    if float.fract() == 0.0 {
         return format!("{float:.0}");
     }
     float.to_string()
