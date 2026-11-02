@@ -186,6 +186,10 @@ pub struct FillOptions {
     /// Drops the paragraphs holding `{::stylepar}` tags.
     pub drop_style_paragraphs: bool,
     pub comments: CommentDefaults,
+    /// A bookmark prefix such as `tag_`. When rich text turns a tag's paragraph into several, and
+    /// the tag's paragraph has a bookmark named this prefix and a number (`tag_3`), each later
+    /// paragraph gets its own bookmark `tag_3_1`, `tag_3_2`, …, so a reader can find them all.
+    pub continued_bookmarks: Option<String>,
 }
 
 impl Default for FillOptions {
@@ -202,6 +206,7 @@ impl Default for FillOptions {
             document: DocumentEdits::default(),
             drop_style_paragraphs: false,
             comments: CommentDefaults::default(),
+            continued_bookmarks: None,
         }
     }
 }
@@ -260,6 +265,7 @@ pub struct PackageTemplate {
     drop_empty_last_page: bool,
     document: DocumentEdits,
     max_drawing_id: u32,
+    max_bookmark_id: u32,
     max_footnote_id: u32,
     max_comment_id: Option<u32>,
     body: Option<(f64, f64)>,
@@ -297,6 +303,7 @@ impl PackageTemplate {
             PackagePart::Bytes(_) => None,
         });
         let max_drawing_id = templates().map(|(_, template)| template.max_drawing_id).max().unwrap_or(0);
+        let max_bookmark_id = templates().map(|(_, template)| template.max_bookmark_id).max().unwrap_or(0);
         let body = templates().find(|(name, _)| *name == DOCUMENT_PART).and_then(|(_, template)| template.body);
         let max_footnote_id = parsed.iter().find_map(|(name, part)| match part {
             PackagePart::Bytes(bytes) if name == footnotes::FOOTNOTES_PART => Some(footnotes::read_max_id(&String::from_utf8_lossy(bytes))),
@@ -311,6 +318,7 @@ impl PackageTemplate {
             drop_empty_last_page: options.drop_empty_last_page,
             document: options.document.clone(),
             max_drawing_id,
+            max_bookmark_id,
             max_footnote_id: max_footnote_id.unwrap_or(0),
             body,
             parts: parsed,
@@ -338,6 +346,7 @@ impl PackageTemplate {
             container_fill: CONTAINER_FILL,
             next_footnote_id: self.max_footnote_id + 1,
             next_comment_id: self.max_comment_id.map_or(0, |id| id + 1),
+            next_bookmark_id: self.max_bookmark_id + 1,
         };
         let mut comments = Vec::new();
         let mut out: Vec<(String, Cow<[u8]>)> = Vec::with_capacity(self.parts.len());
