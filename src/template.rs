@@ -149,6 +149,9 @@ pub struct Template {
     pub(crate) comment_defaults: Option<CommentDefaults>,
     /// The largest drawing id the part uses, so new drawings take ids after it.
     pub(crate) max_drawing_id: u32,
+    /// The largest bookmark id the part uses, so continuation bookmarks take ids after it.
+    pub(crate) max_bookmark_id: u32,
+    pub(crate) continued_bookmarks: Option<String>,
     /// Page width and height in pixels, less margins, from the part's last section.
     pub(crate) body: Option<(f64, f64)>,
 }
@@ -246,6 +249,8 @@ impl Template {
         let blocks = pair_blocks(&parts, &tags, &paragraphs, options)?;
         let mut template = Template {
             max_drawing_id: crate::images::read_max_drawing_id(xml),
+            max_bookmark_id: crate::footnotes::read_max_element_id(xml, "w:bookmarkStart"),
+            continued_bookmarks: options.continued_bookmarks.clone().filter(|_| options.extensions.rich_text),
             body: crate::images::read_body_size(xml),
             parts,
             tags,

@@ -106,8 +106,9 @@ pub(crate) fn mark(index: usize) -> String {
 }
 
 /// A filled paragraph holding rich text marks, rewritten with the values' runs and paragraphs.
-/// External links are added to `links`, whose position names their relationship.
-pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue], links: &mut Vec<String>) -> String {
+/// External links are added to `links`, whose position names their relationship. `continued`
+/// gives the bookmark prefix whose later paragraphs get numbered bookmarks, and the next free id.
+pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue], links: &mut Vec<String>, continued: Option<(&str, &mut u32)>) -> String {
     let Some((mark, index)) = find_mark(paragraph) else { return paragraph.to_string() };
     let value = &values[index];
     let other_text = read_text(paragraph).replacen(&mark, "", 1);
@@ -120,9 +121,19 @@ pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue], links: &mut
         let open = &paragraph[..paragraph.find('>').map_or(0, |at| at + 1)];
         let paragraph_props = find_between(paragraph, "<w:pPr>", "</w:pPr>").unwrap_or("");
         let bookmarks = find_bookmarks(paragraph);
+        let mut continued = continued.and_then(|(prefix, next_id)| find_numbered_bookmark(&bookmarks, prefix).map(|name| (name, next_id)));
         let mut out = String::new();
         for (index, block) in blocks.iter().enumerate() {
-            let bookmarks = if index == 0 { bookmarks.as_str() } else { "" };
+            let later = match (&mut continued, index) {
+                (_, 0) => String::new(),
+                (Some((name, next_id)), _) => {
+                    let id = **next_id;
+                    **next_id += 1;
+                    format!("<w:bookmarkStart w:id=\"{id}\" w:name=\"{name}_{index}\"/><w:bookmarkEnd w:id=\"{id}\"/>")
+                }
+                (None, _) => String::new(),
+            };
+            let bookmarks = if index == 0 { bookmarks.as_str() } else { later.as_str() };
             write_block(&mut out, open, paragraph_props, bookmarks, block, run_props, links);
         }
         // A table cannot end a cell; the tag paragraph's look follows it.
@@ -138,7 +149,7 @@ pub(crate) fn write_paragraph(paragraph: &str, values: &[RichValue], links: &mut
         Some(run) => paragraph.replacen(run, &split_run(run, &mark, &inline), 1),
         None => paragraph.replacen(&mark, "", 1),
     };
-    write_paragraph(&replaced, values, links)
+    write_paragraph(&replaced, values, links, continued)
 }
 
 fn write_block(out: &mut String, open: &str, paragraph_props: &str, bookmarks: &str, block: &Block, run_props: &str, links: &mut Vec<String>) {
@@ -246,6 +257,19 @@ fn find_between<'a>(xml: &'a str, open: &str, close: &str) -> Option<&'a str> {
     let start = xml.find(open)?;
     let end = start + xml[start..].find(close)? + close.len();
     Some(&xml[start..end])
+}
+
+/// The name of the first bookmark named `prefix` and a number, such as `tag_3`.
+fn find_numbered_bookmark(bookmarks: &str, prefix: &str) -> Option<String> {
+    let mut rest = bookmarks;
+    while let Some(at) = rest.find("w:name=\"") {
+        rest = &rest[at + "w:name=\"".len()..];
+        let name = &rest[..rest.find('"')?];
+        if name.strip_prefix(prefix).is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// Every self-closing `<w:bookmarkStart>` and `<w:bookmarkEnd>`, in order.

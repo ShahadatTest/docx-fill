@@ -133,3 +133,18 @@ fn prints_rich_text_in_a_text_box_paragraph() {
     assert_eq!(text(&body), "anchorab");
     assert_eq!(body.matches("<w:pStyle").count(), 2);
 }
+
+#[test]
+fn numbers_the_tag_bookmark_on_later_paragraphs() {
+    let options = docx_fill::FillOptions { continued_bookmarks: Some("scope_tag_".to_string()), ..docx_fill::FillOptions::default() };
+    let template = format!(r#"{}<w:p><w:bookmarkStart w:id="7" w:name="other"/><w:bookmarkEnd w:id="7"/></w:p>"#, tag_paragraph("~~html:a.value", ""));
+    let xml = docx_fill::fill_part(&template, &json!({ "html:a.value": "<p>a</p><p>b</p><p>c</p>" }), &options).unwrap();
+    let paragraphs = paragraphs(&xml);
+
+    assert!(paragraphs[0].contains(r#"w:name="scope_tag_0""#));
+    assert!(paragraphs[1].contains(r#"<w:bookmarkStart w:id="8" w:name="scope_tag_0_1"/><w:bookmarkEnd w:id="8"/>"#), "{xml}");
+    assert!(paragraphs[2].contains(r#"<w:bookmarkStart w:id="9" w:name="scope_tag_0_2"/>"#));
+
+    let xml = fill_html("<p>a</p><p>b</p>", "");
+    assert!(!xml.contains("scope_tag_0_1"));
+}

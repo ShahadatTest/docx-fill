@@ -65,6 +65,7 @@ pub(crate) struct FillState {
     pub container_fill: f64,
     pub next_footnote_id: u32,
     pub next_comment_id: u32,
+    pub next_bookmark_id: u32,
 }
 
 /// A filled part and the media its drawings show.
@@ -128,7 +129,7 @@ impl Template {
     /// The part filled with `data`, asking `hooks` for module tags and images. An image's media
     /// part and relationship are not added: fill a [`crate::PackageTemplate`] for that.
     pub fn render_with(&self, data: &Value, hooks: &mut dyn FillHooks) -> String {
-        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1, next_comment_id: 0 };
+        let mut state = FillState { next_drawing_id: self.max_drawing_id + 1, body: None, container_fill: crate::CONTAINER_FILL, next_footnote_id: 1, next_comment_id: 0, next_bookmark_id: self.max_bookmark_id + 1 };
         let filled = self.fill(data, "", hooks, &mut state);
         // Only a package prints subtemplates.
         if filled.includes.is_empty() {
@@ -423,7 +424,7 @@ impl<'a> Render<'a, '_> {
                 if !has_rich_text && style.is_none() {
                     return;
                 }
-                let mut written = if has_rich_text { rich_text::write_paragraph(&self.out[opened..], &self.rich_values, &mut self.links) } else { self.out[opened..].to_string() };
+                let mut written = if has_rich_text { rich_text::write_paragraph(&self.out[opened..], &self.rich_values, &mut self.links, self.template.continued_bookmarks.as_deref().map(|prefix| (prefix, &mut self.state.next_bookmark_id))) } else { self.out[opened..].to_string() };
                 if let Some(style) = style {
                     written = edit_each(&written, PARAGRAPH, |paragraph| style_paragraph(paragraph, &style, true));
                 }
