@@ -40,3 +40,7 @@ Behaviour is built from the WordprocessingML spec (ECMA-376), docxtemplater's pu
 There is no link module: docxtemplater's site has none. HTML `<a>` links cover it.
 
 Not affiliated with docxtemplater.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE). Contributions are under the same licence.

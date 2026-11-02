@@ -3,6 +3,8 @@ name = "docx-fill"
 description = "Fills DOCX templates written in docxtemplater's tag syntax"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/finwarman/docx-fill"
 publish = false
 
 [dependencies]
