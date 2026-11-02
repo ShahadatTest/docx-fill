@@ -274,7 +274,7 @@ pub struct PackageTemplate {
 
 #[derive(Debug)]
 enum PackagePart {
-    Template(Template),
+    Template(Box<Template>),
     Bytes(Vec<u8>),
 }
 
@@ -295,7 +295,7 @@ impl PackageTemplate {
             };
             let xml = String::from_utf8(bytes).map_err(|_| in_part(FillError::new("The part is not UTF-8")))?;
             let template = Template::parse(&xml, options).map_err(in_part)?;
-            parsed.push((name, PackagePart::Template(template)));
+            parsed.push((name, PackagePart::Template(Box::new(template))));
         }
 
         let templates = || parsed.iter().filter_map(|(name, part)| match part {
