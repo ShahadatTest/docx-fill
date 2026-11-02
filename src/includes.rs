@@ -19,7 +19,6 @@ const NUMBERING_PART: &str = "word/numbering.xml";
 const NUMBERING_RELATIONSHIP: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
 const NUMBERING_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-const SUB_RELATIONSHIPS: &str = "word/_rels/document.xml.rels";
 // Body elements pointing into parts an include does not bring.
 const DROPPED: [&str; 5] = ["w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference", "w:endnoteReference"];
 const STYLE_REFERENCES: [&str; 3] = ["w:pStyle", "w:rStyle", "w:tblStyle"];
@@ -92,7 +91,7 @@ pub(crate) fn print_includes(parts: &mut Vec<(String, Cow<[u8]>)>, uses: &[(Stri
             };
             count += 1;
             let rendered = include.render(scope, hooks);
-            let import = Import { parts: &mut *parts, part, from: &rendered, count, name, styles: include.styles };
+            let import = Import { parts: &mut *parts, part, from: &rendered, count, name, styles: include.styles, copied: BTreeMap::new() };
             bodies.push(import.run(&mut next_drawing_id));
         }
         let Some(index) = parts.iter().position(|(name, _)| name == part) else { continue };
@@ -126,6 +125,8 @@ struct Import<'a, 'b> {
     count: usize,
     name: &'a str,
     styles: IncludeStyles,
+    /// The new name of each part copied so far.
+    copied: BTreeMap<String, String>,
 }
 
 /// What an attribute edit does.
@@ -146,7 +147,7 @@ impl Import<'_, '_> {
         }
         self.merge_namespaces(self.part, &document);
 
-        let relationships = self.import_relationships(&body);
+        let relationships = self.import_relationships(&body, DOCUMENT_PART);
         let (notes, note_ids) = self.read_notes(&body);
         let definitions = read_styles(&self.read_from(STYLES_PART));
         let used_styles = read_style_closure(&format!("{body}{notes}"), &definitions);
@@ -207,10 +208,11 @@ impl Import<'_, '_> {
         }
     }
 
-    /// Copies the relationships `body` uses, and their parts, giving each a new id.
-    fn import_relationships(&mut self, body: &str) -> BTreeMap<String, String> {
-        let used = read_values(body, |_, attribute| attribute.starts_with("r:"));
-        let relationships = self.read_from(SUB_RELATIONSHIPS);
+    /// Copies the relationships of `from_part` that `xml` uses, and their parts, giving each a
+    /// new id on the including part.
+    fn import_relationships(&mut self, xml: &str, from_part: &str) -> BTreeMap<String, String> {
+        let used = read_values(xml, |_, attribute| attribute.starts_with("r:"));
+        let relationships = self.read_from(&relationships_of(from_part));
         let mut renamed = BTreeMap::new();
         let Ok(tokens) = tokenize(&relationships) else { return renamed };
         for token in tokens {
@@ -223,8 +225,8 @@ impl Import<'_, '_> {
             let new_id = format!("rIdDocxFillInclude{}_{safe}", self.count);
             let is_external = read_attribute(raw, "TargetMode") == Some("External");
             let new_target = if is_external { target.to_string() } else {
-                let Some(target) = self.copy_part(target) else { continue };
-                target
+                let Some(copied) = self.copy_part(&resolve(from_part, target)) else { continue };
+                relative_to(self.part, &copied)
             };
             let mode = if is_external { " TargetMode=\"External\"" } else { "" };
             let relationship = format!("<Relationship Id=\"{new_id}\" Type=\"{kind}\" Target=\"{new_target}\"{mode}/>");
@@ -234,13 +236,16 @@ impl Import<'_, '_> {
         renamed
     }
 
-    /// Copies the part `target` (relative to `word/`) names under a new name, with its content
-    /// type. The new target, relative to the including part's folder.
-    fn copy_part(&mut self, target: &str) -> Option<String> {
-        let source = resolve(target);
+    /// Copies part `source` under a new name, with its content type and the parts its own
+    /// relationships target. The new name.
+    fn copy_part(&mut self, source: &str) -> Option<String> {
+        if let Some(copied) = self.copied.get(source) {
+            return Some(copied.clone());
+        }
         let bytes = self.from.iter().find(|(name, _)| *name == source)?.1.to_vec();
-        let (folder, file) = source.rsplit_once('/').unwrap_or(("", &source));
+        let (folder, file) = source.rsplit_once('/').unwrap_or(("", source));
         let copied = format!("{folder}/docx_fill_include{}_{file}", self.count);
+        self.copied.insert(source.to_string(), copied.clone());
 
         let types = self.read_from(CONTENT_TYPES_PART);
         let override_type = read_content_type(&types, "Override", "PartName", &format!("/{source}"));
@@ -260,12 +265,39 @@ impl Import<'_, '_> {
             }
         }
         self.parts.push((copied.clone(), Cow::Owned(bytes)));
+        self.copy_relationships(source, &copied);
+        Some(copied)
+    }
 
-        let own_folder = self.part.rfind('/').map_or("", |at| &self.part[..at + 1]);
-        Some(match copied.strip_prefix(own_folder) {
-            Some(relative) if !own_folder.is_empty() => relative.to_string(),
-            _ => format!("/{copied}"),
-        })
+    /// Writes the relationships of part `source` for its copy, copying the parts they target.
+    fn copy_relationships(&mut self, source: &str, copied: &str) {
+        let relationships = self.read_from(&relationships_of(source));
+        let Ok(tokens) = tokenize(&relationships) else { return };
+        let tokens: Vec<(bool, String)> = tokens
+            .iter()
+            .map(|token| match *token {
+                Token::Element { kind: ElementKind::Open | ElementKind::SelfClosing, name: "Relationship", raw } => (true, raw.to_string()),
+                Token::Element { raw, .. } => (false, raw.to_string()),
+                Token::Text(text) => (false, text.to_string()),
+            })
+            .collect();
+        if !tokens.iter().any(|(is_relationship, _)| *is_relationship) {
+            return;
+        }
+        let mut written = String::new();
+        for (is_relationship, raw) in tokens {
+            let target = read_attribute(&raw, "Target").filter(|_| is_relationship && read_attribute(&raw, "TargetMode") != Some("External"));
+            let Some(target) = target else {
+                written.push_str(&raw);
+                continue;
+            };
+            let resolved = resolve(source, target);
+            match self.copy_part(&resolved) {
+                Some(new_part) => written.push_str(&crate::properties::set_attribute(&raw, "Target", &relative_to(copied, &new_part))),
+                None => written.push_str(&raw),
+            }
+        }
+        self.parts.push((relationships_of(copied), Cow::Owned(written.into_bytes())));
     }
 
     /// The footnotes `body` references, with new ids, and the new id for each old one.
@@ -362,6 +394,8 @@ impl Import<'_, '_> {
         let (mut next_number, mut next_abstract) = (max("w:num", "w:numId") + 1, max("w:abstractNum", "w:abstractNumId") + 1);
 
         let abstracts = read_keyed(&from, "w:abstractNum", "w:abstractNumId");
+        let main_abstracts = read_keyed(main_xml, "w:abstractNum", "w:abstractNumId");
+        let main_numbers = read_keyed(main_xml, "w:num", "w:numId");
         let mut abstract_ids = BTreeMap::new();
         let (mut added_abstracts, mut added_numbers) = (String::new(), String::new());
         for (id, number) in read_keyed(&from, "w:num", "w:numId") {
@@ -370,6 +404,11 @@ impl Import<'_, '_> {
             }
             let Some(abstract_id) = read_values(&number, |element, attribute| element == "w:abstractNumId" && attribute == "w:val").into_iter().next() else { continue };
             let Some(definition) = abstracts.get(&abstract_id) else { continue };
+            // A list the main document has, level by level, continues there.
+            if let Some(reused) = find_same_list(definition, &number, &main_abstracts, &main_numbers) {
+                renamed.insert(id, reused);
+                continue;
+            }
             let new_abstract = abstract_ids.entry(abstract_id).or_insert_with(|| {
                 let id = next_abstract.to_string();
                 next_abstract += 1;
@@ -414,6 +453,30 @@ impl Import<'_, '_> {
         self.merge_namespaces(NUMBERING_PART, &from);
         renamed
     }
+}
+
+/// The main document's list with the same number format, text and tab at every level as
+/// `definition`, when `number` overrides none of them.
+fn find_same_list(definition: &str, number: &str, main_abstracts: &BTreeMap<String, String>, main_numbers: &BTreeMap<String, String>) -> Option<String> {
+    let levels = read_levels(definition);
+    if levels.is_empty() || number.contains("<w:lvlOverride") {
+        return None;
+    }
+    let (abstract_id, _) = main_abstracts.iter().find(|(_, main)| read_levels(main) == levels)?;
+    main_numbers
+        .iter()
+        .find(|(_, main)| !main.contains("<w:lvlOverride") && read_values(main, |element, attribute| element == "w:abstractNumId" && attribute == "w:val").contains(abstract_id))
+        .map(|(id, _)| id.clone())
+}
+
+/// Each level's number format, text and tab position.
+fn read_levels(definition: &str) -> Vec<[Option<String>; 3]> {
+    let read = |level: &str, element: &str, attribute: &str| read_values(level, |each, name| each == element && name == attribute).into_iter().next();
+    find_starts(definition, "w:lvl")
+        .into_iter()
+        .filter_map(|start| find_element_end(definition, start, "w:lvl").map(|end| &definition[start..end]))
+        .map(|level| [read(level, "w:numFmt", "w:val"), read(level, "w:lvlText", "w:val"), read(level, "w:tab", "w:pos")])
+        .collect()
 }
 
 /// The styles `xml` uses, and those they are based on, linked to or followed by.
@@ -463,12 +526,28 @@ fn read_root(xml: &str) -> Option<&str> {
     })
 }
 
-/// A part a relationship targets, from `word/`.
-fn resolve(target: &str) -> String {
+/// The relationships part of `part`.
+pub(crate) fn relationships_of(part: &str) -> String {
+    let (folder, file) = part.rsplit_once('/').map_or(("", part), |(folder, file)| (folder, file));
+    if folder.is_empty() { format!("_rels/{file}.rels") } else { format!("{folder}/_rels/{file}.rels") }
+}
+
+/// `path` as a relationship target from `part`: relative within its folder, else absolute.
+pub(crate) fn relative_to(part: &str, path: &str) -> String {
+    let folder = part.rfind('/').map_or("", |at| &part[..at + 1]);
+    match path.strip_prefix(folder) {
+        Some(relative) if !folder.is_empty() => relative.to_string(),
+        _ => format!("/{path}"),
+    }
+}
+
+/// The part a relationship of `part` targets.
+pub(crate) fn resolve(part: &str, target: &str) -> String {
     if let Some(absolute) = target.strip_prefix('/') {
         return absolute.to_string();
     }
-    let mut path: Vec<&str> = vec!["word"];
+    let mut path: Vec<&str> = part.split('/').collect();
+    path.pop();
     for segment in target.split('/') {
         match segment {
             ".." => {

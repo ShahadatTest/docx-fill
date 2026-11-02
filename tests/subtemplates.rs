@@ -1,7 +1,9 @@
 mod common;
 
 use common::{document, paragraph_texts};
-use docx_fill::{FillOptions, IncludeMode, IncludeStyles, PackageTemplate, Subtemplate};
+use std::sync::Arc;
+
+use docx_fill::{FillHooks, FillOptions, Image, IncludeMode, IncludeStyles, NoHooks, PackageTemplate, Subtemplate};
 use serde_json::{Value, json};
 
 const TYPES: &str = r#"<Types xmlns="t"><Default Extension="xml" ContentType="application/xml"/></Types>"#;
@@ -177,4 +179,92 @@ fn a_single_part_fill_prints_no_include_marks() {
     let xml = docx_fill::fill_part(&document(r#"<w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p>"#), &json!({ "doc": "part" }), &FillOptions::default()).unwrap();
 
     assert!(!xml.contains(['\u{E005}', '\u{E006}']) && !xml.contains("<w:p>"));
+}
+
+fn fill_with(main: Vec<(String, Vec<u8>)>, sub: Vec<(String, Vec<u8>)>, data: Value, mode: IncludeMode, hooks: &mut dyn FillHooks) -> Vec<(String, String)> {
+    let options = FillOptions::default();
+    let mut template = PackageTemplate::parse(main, &options).unwrap();
+    template.add_include("part", Subtemplate::parse(sub, &options, mode, IncludeStyles::UseMain).unwrap());
+    template.render_with(&data, hooks).into_iter().map(|(name, bytes)| (name, String::from_utf8_lossy(&bytes).into_owned())).collect()
+}
+
+fn with_part(mut parts: Vec<(String, Vec<u8>)>, name: &str, xml: &str) -> Vec<(String, Vec<u8>)> {
+    parts.retain(|(each, _)| each != name);
+    parts.push((name.to_string(), xml.as_bytes().to_vec()));
+    parts
+}
+
+#[test]
+fn continues_a_list_the_main_document_has_level_by_level() {
+    let main_numbering = r#"<w:numbering xmlns:w="w"><w:abstractNum w:abstractNumId="5"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="9"><w:abstractNumId w:val="5"/></w:num></w:numbering>"#;
+    let main = with_part(main_parts(r#"<w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p>"#), "word/numbering.xml", main_numbering);
+    let parts = fill_with(main, sub_parts(), json!({ "doc": "part" }), IncludeMode::AsIs, &mut NoHooks);
+
+    assert_eq!(part(&parts, "word/numbering.xml"), main_numbering);
+    assert!(part(&parts, "word/document.xml").contains(r#"<w:numId w:val="9"/>"#));
+}
+
+#[test]
+fn copies_a_new_list_when_an_override_or_level_differs() {
+    let main_numbering = r#"<w:numbering xmlns:w="w"><w:abstractNum w:abstractNumId="5"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum><w:num w:numId="9"><w:abstractNumId w:val="5"/></w:num></w:numbering>"#;
+    let main = with_part(main_parts(r#"<w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p>"#), "word/numbering.xml", main_numbering);
+    let parts = fill_with(main, sub_parts(), json!({ "doc": "part" }), IncludeMode::AsIs, &mut NoHooks);
+
+    let numbering = part(&parts, "word/numbering.xml");
+    assert!(numbering.contains(r#"<w:abstractNum w:abstractNumId="6">"#));
+    assert!(numbering.contains(r#"<w:num w:numId="11"><w:abstractNumId w:val="6"/></w:num></w:numbering>"#));
+}
+
+#[test]
+fn copies_the_parts_a_copied_part_relates_to() {
+    let sub = with_part(sub_parts(), "word/document.xml", r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p><w:r><c:chart r:id="rId7"/></w:r></w:p></w:body></w:document>"#);
+    let sub = with_part(sub, "word/_rels/document.xml.rels", r#"<Relationships xmlns="r"><Relationship Id="rId7" Type="chart" Target="charts/chart1.xml"/></Relationships>"#);
+    let sub = with_part(sub, "word/charts/chart1.xml", "<c:chartSpace/>");
+    let sub = with_part(sub, "word/charts/_rels/chart1.xml.rels", r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="package" Target="../embeddings/sheet.xlsx"/><Relationship Id="rId2" Type="link" Target="https://x" TargetMode="External"/></Relationships>"#);
+    let sub = with_part(sub, "word/embeddings/sheet.xlsx", "xlsx");
+    let sub = with_part(sub, "[Content_Types].xml", r#"<Types xmlns="t"><Default Extension="xlsx" ContentType="sheet"/><Override PartName="/word/charts/chart1.xml" ContentType="chart+xml"/></Types>"#);
+    let parts = fill_with(main_parts(r#"<w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p>"#), sub, json!({ "doc": "part" }), IncludeMode::AsIs, &mut NoHooks);
+
+    assert_eq!(part(&parts, "word/charts/docx_fill_include1_chart1.xml"), "<c:chartSpace/>");
+    assert_eq!(part(&parts, "word/embeddings/docx_fill_include1_sheet.xlsx"), "xlsx");
+    let rels = part(&parts, "word/charts/_rels/docx_fill_include1_chart1.xml.rels");
+    assert!(rels.contains(r#"Target="/word/embeddings/docx_fill_include1_sheet.xlsx""#) && rels.contains(r#"Target="https://x" TargetMode="External""#));
+    let types = part(&parts, "[Content_Types].xml");
+    assert!(types.contains(r#"<Override PartName="/word/charts/docx_fill_include1_chart1.xml" ContentType="chart+xml"/>"#));
+    assert!(types.contains(r#"<Default Extension="xlsx" ContentType="sheet"/>"#));
+    assert!(part(&parts, "word/_rels/document.xml.rels").contains(r#"Target="charts/docx_fill_include1_chart1.xml""#));
+}
+
+#[test]
+fn includes_into_a_header_with_its_own_relationships() {
+    let header = r#"<w:hdr xmlns:w="w" xmlns:r="r"><w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p></w:hdr>"#;
+    let main = with_part(main_parts("<w:p/>"), "word/header1.xml", header);
+    let parts = fill_with(main, sub_parts(), json!({ "doc": "part" }), IncludeMode::AsIs, &mut NoHooks);
+
+    let xml = part(&parts, "word/header1.xml");
+    assert!(xml.contains("Quoted") && xml.contains(r#"r:embed="rIdDocxFillInclude1_rId5""#));
+    assert!(xml.starts_with(r#"<w:hdr xmlns:w="w" xmlns:r="r" xmlns:wp14="x14" xmlns:mc="mc" mc:Ignorable="wp14">"#));
+    assert!(part(&parts, "word/_rels/header1.xml.rels").contains(r#"Target="media/docx_fill_include1_image1.png""#));
+    assert!(part(&parts, "word/_rels/document.xml.rels").contains("numbering.xml"));
+}
+
+struct Photos;
+
+impl FillHooks for Photos {
+    fn image(&mut self, _part: &str, value: &Value) -> Option<Image> {
+        Some(Image { key: value.as_str()?.to_string(), bytes: Arc::from(&b"jpeg"[..]), extension: "jpeg".to_string(), width: 2.0, height: 1.0 })
+    }
+}
+
+#[test]
+fn includes_images_a_templated_subtemplate_draws_from_hooks() {
+    let sub = with_part(sub_parts(), "word/document.xml", r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p><w:r><w:t>{%photo}</w:t></w:r></w:p></w:body></w:document>"#);
+    let body = r#"<w:p><w:r><w:t>{#items}</w:t></w:r></w:p><w:p><w:r><w:t>{:include doc}</w:t></w:r></w:p><w:p><w:r><w:t>{/items}</w:t></w:r></w:p>"#;
+    let parts = fill_with(main_parts(body), sub, json!({ "doc": "part", "items": [{ "photo": "a" }, { "photo": "b" }] }), IncludeMode::Templated, &mut Photos);
+
+    assert_eq!(part(&parts, "word/media/docx_fill_include1_docx_fill_a.jpeg"), "jpeg");
+    assert_eq!(part(&parts, "word/media/docx_fill_include2_docx_fill_b.jpeg"), "jpeg");
+    let xml = part(&parts, "word/document.xml");
+    assert!(xml.contains(r#"r:embed="rIdDocxFillInclude1_rIdDocxFilla""#) && xml.contains(r#"r:embed="rIdDocxFillInclude2_rIdDocxFillb""#));
+    assert!(part(&parts, "[Content_Types].xml").contains(r#"Extension="jpeg""#));
 }
