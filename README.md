@@ -31,7 +31,7 @@ let template = docx_fill::PackageTemplate::parse(parts, &docx_fill::FillOptions:
 let filled = template.render(&serde_json::json!({ "name": "Value" }));
 ```
 
-Tests: `cargo test`.
+Tests: `cargo test`. To contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Sources
 

@@ -722,10 +722,8 @@ fn read_font_size(size: &str) -> Option<u32> {
     let size = size.trim();
     let (number, points_per_unit) = if let Some(px) = size.strip_suffix("px") {
         (px, 0.75)
-    } else if let Some(pt) = size.strip_suffix("pt") {
-        (pt, 1.0)
     } else {
-        return None;
+        (size.strip_suffix("pt")?, 1.0)
     };
     let points = number.trim().parse::<f64>().ok()? * points_per_unit;
     (points > 0.0).then(|| (points * 2.0).round() as u32)
